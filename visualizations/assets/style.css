@@ -200,3 +200,4 @@ h1 { margin-bottom: 2px; }
 .blk.sel { border-color: var(--c2); box-shadow: 0 0 0 1px var(--c2) inset; }
 .blk.future { opacity: .38; }
 .rowlab { font: 11px ui-monospace, monospace; color: var(--muted); margin: 0 0 4px; }
+.cell.rd { background: color-mix(in srgb, var(--c1) 55%, var(--surface)); }

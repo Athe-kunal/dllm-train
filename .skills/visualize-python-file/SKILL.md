@@ -7,7 +7,7 @@ description: How to write an interactive, line-by-line visualization of a Python
 
 The output is one self-contained HTML page in `visualizations/`, built from the shared
 `assets/common.js` + `assets/style.css`. No build step, no CDN, no external requests.
-Good examples to copy from: `utils.html` (tabs, one function each), `mdlm.html`
+Good examples to copy from: `options.html` (one tab per option, each a short stepper), `reveal_order.html` (no stepper: aggregate over many simulated runs), `compare.html` (two decoders in lockstep), `tensors.html` (arithmetic table linked to code lines), `training.html` (a frame per noise level), `utils.html` (tabs, one function each), `mdlm.html`
 (phases per step + an explorer tab), `bd3lm.html` (state strip + cost counters),
 `schedulers.html` (sliders instead of a stepper).
 
@@ -55,6 +55,7 @@ Good examples to copy from: `utils.html` (tabs, one function each), `mdlm.html`
 | `watch(host, [[name, value, note?], …])` | The live-variable panel (shapes, values, "before → after"). |
 | `stepper(host, onFrame, ms)` → `{setN(n, keepFrame), get()}` | ◀ play ▶ slider, ← → keys, `#f=N` deep link. Call `setN` whenever the frames are rebuilt. |
 | `lineChart(host, {xs|x, series, y, markers, dots, …})`, `barChart(host, {vals, line})` | SVG charts with a hover crosshair / tooltip. |
+| `svgBars(vals, {labels, hi, color, fmt})` | Small labelled bar chart for logits / probabilities; `-Infinity` draws a dashed "−inf" stub. Labels are HTML-escaped: **escape any token text you put in captions yourself** (`_esc`), because `<eos>` written raw disappears as a tag. |
 | `bindRange(id, cb)` | Range input + its `<output id="id_o">` + callback. |
 | `mulberry32(seed)` | Seeded RNG so frames are reproducible. |
 | `numTransfer`, `ALPHA`, `reverseMaskProb32`, `kappaCubic` | JS ports of the repo's scheduler / `get_num_transfer_tokens`. Reuse instead of re-porting. |
@@ -94,6 +95,8 @@ window bracket. Colours are CSS variables (`--c1..--c4`, `--bad`, …) and adapt
 - **`vh` inside an iframe** is the iframe's own height: no `max-height: NNvh` in embed mode (handled by
   `.embed .code{max-height:none}`), and report height with `document.body.offsetHeight`, not
   `scrollHeight` (which can never shrink below the iframe's current height).
+- **Raw `<` in text**: tokens like `<eos>`/`<bos>` are swallowed as HTML tags unless escaped (charts and chips escape for you; captions do not).
+- **Re-rendering while dragging**: a control whose handler rebuilds the DOM that contains it must use `change` (on release), not `input`.
 - **Negative bars**: leave room below for the value label and the category label.
 - **Screenshots of long pages**: use one tall window and crop; `#anchor` jumps and lazy iframes
   outside the window produce blank images.

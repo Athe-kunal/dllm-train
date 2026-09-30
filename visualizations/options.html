@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Decoding options — dllm/core/samplers/mdlm.py</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("options.html"))</script>
+
+<h1>Decoding options</h1>
+<p class="sub">The knobs in <code>MDLMSamplerConfig</code>, one tab each: what the code does with the option, with the real lines beside it. Step with ← →</p>
+
+<div class="tabs"><button id="tab_cfg" class="on">cfg_scale</button><button id="tab_shift">right_shift_logits</button><button id="tab_suppress">suppress tokens</button><button id="tab_remask">remasking</button></div>
+
+<div class="panel">
+  <div class="controls" id="ctl_cfg">
+    <label>cfg_scale <input type="range" id="c_s" min="0" max="4" step="0.5" value="2"><output id="c_s_o"></output></label>
+    <label>cfg_keep_tokens (words that stay visible) <input type="text" id="c_keep" value="&lt;bos&gt;" style="width:130px"></label>
+    <label>cond logits <input type="text" id="c_cond" value="1.6, 1.1, -0.4, 0.3, 0.0" style="width:150px"></label>
+    <label>uncond logits <input type="text" id="c_un" value="0.2, 0.9, 1.0, 0.5, 0.1" style="width:150px"></label>
+  </div>
+  <div class="controls" id="ctl_shift" hidden>
+    <label><span>right_shift_logits</span><input type="checkbox" id="s_on" checked></label>
+    <label>prompt length <input type="range" id="s_P" min="1" max="8" value="4"><output id="s_P_o"></output></label>
+    <label>max_new_tokens <input type="range" id="s_N" min="4" max="12" value="8"><output id="s_N_o"></output></label>
+    <label>block_size <input type="range" id="s_bs" min="1" max="8" value="4"><output id="s_bs_o"></output></label>
+    <label>block b <input type="range" id="s_b" min="0" max="7" value="0"><output id="s_b_o"></output></label>
+  </div>
+  <div class="controls" id="ctl_suppress" hidden>
+    <label>logits (the, cat, sat, mat, &lt;eos&gt;, &lt;pad&gt;) <input type="text" id="u_logits" value="1.5, 0.5, 0.2, 1.0, 2.5, 0.8" style="width:190px"></label>
+    <label>suppress_tokens <input type="text" id="u_sup" value="&lt;pad&gt;" style="width:120px"></label>
+    <label>begin_suppress_tokens <input type="text" id="u_bsup" value="&lt;eos&gt;" style="width:120px"></label>
+  </div>
+  <div class="controls" id="ctl_remask" hidden>
+    <label>candidates W <input type="range" id="r_W" min="6" max="16" value="10"><output id="r_W_o"></output></label>
+    <label>k (reveal this step) <input type="range" id="r_k" min="1" max="8" value="3"><output id="r_k_o"></output></label>
+    <button id="r_re">resample</button>
+  </div>
+  <div id="stp" style="margin-top:12px"></div>
+</div>
+
+<div class="split" style="margin-top:14px">
+  <div>
+    <div class="cap" id="cap"></div>
+    <div class="panel"><div class="seqs" id="viz"></div></div>
+  </div>
+  <div class="sticky"><div id="code"></div><div id="watch"></div></div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+const nums = (v) => v.split(",").map((s) => parseFloat(s)).filter((x) => !isNaN(x));
+const list = (a, k = 2) => "[" + a.map((v) => (v === -Infinity ? "−inf" : +v.toFixed(k))).join(", ") + "]";
+const softmax = (l) => { const m = Math.max(...l.filter(isFinite)), e = l.map((v) => (isFinite(v) ? Math.exp(v - m) : 0)), s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s); };
+const lbl = (t) => `<div class="mini" style="margin-top:10px">${t}</div>`;
+const chips = (arr) => `<div class="trk" style="gap:6px">${arr.map((a) => `<div class="wt ${a.c}">${_esc(a.t)}</div>`).join("")}</div>`;
+const VOC = ["mat", "hat", "moon", "dog", "sky", "tree", "cup", "box"];
+
+/* =========================================================
+   cfg_scale
+   ========================================================= */
+const CODE_CFG = `# once, before decoding
+@given|unmasked_index = (x != mask_id) & attention_mask.bool()   # tokens that were given
+@given|keep_mask = torch.isin(x, cfg_keep_tokens)
+@given|unmasked_index = unmasked_index & ~keep_mask               # kept tokens stay visible
+
+# every step, when cfg_scale > 0
+@hide|un_x = x.clone()
+@hide|un_x[unmasked_index] = mask_id                              # hide the prompt
+@batch|x_ = torch.cat([x, un_x], dim=0)                            # [2B, T]
+@batch|logits = self.model(x_, attention_mask=attention_mask.repeat(2, 1)).logits
+@batch|logits, un_logits = torch.chunk(logits, 2, dim=0)
+@mix|logits = un_logits + (cfg_scale + 1) * (logits - un_logits)`;
+const CFG = {
+  code: CODE_CFG, title: "mdlm.py · MDLMSampler.sample (classifier-free guidance)", ctl: "ctl_cfg",
+  build() {
+    this.s = +$c("c_s").value; this.prompt = ["<bos>", "The", "cat", "sat", "on", "the"];
+    const keep = $c("c_keep").value.split(",").map((z) => z.trim()); this.given = this.prompt.map((w) => !keep.includes(w));
+    let cond = nums($c("c_cond").value).slice(0, 8), un = nums($c("c_un").value).slice(0, 8), V = Math.max(2, Math.min(cond.length, un.length));
+    this.cond = cond.slice(0, V); this.un = un.slice(0, V); this.V = V; this.labels = VOC.slice(0, V);
+    this.mixed = this.cond.map((c, i) => this.un[i] + (this.s + 1) * (c - this.un[i]));
+    this.frames = this.s === 0 ? ["off"] : ["given", "hide", "batch", "logits", "mix"];
+  },
+  show(i) {
+    const f = this.frames[i], { prompt, given, cond, un, mixed, s, labels } = this, mk = "[MASK]";
+    const cx = [...prompt.map((w) => ({ t: w, c: "ctx" })), ...[0, 1, 2].map(() => ({ t: mk, c: "msk" }))];
+    const ux = [...prompt.map((w, k) => (given[k] ? { t: mk, c: "msk" } : { t: w, c: "ctx" })), ...[0, 1, 2].map(() => ({ t: mk, c: "msk" }))];
+    const pc = softmax(cond), pm = softmax(mixed), top = (a) => a.indexOf(Math.max(...a));
+    let cap = "", viz = "", w = [], tags = [];
+    if (f === "off") { cap = "<b>cfg_scale = 0</b> · guidance is off: the branch <code>if cfg_scale &gt; 0</code> is skipped and the sampler does one forward pass with the prompt visible. Raise the scale to see what changes."; viz = lbl("x (the only pass)") + chips(cx); w = [["cfg_scale", 0, "no second pass"]]; }
+    else if (f === "given") { cap = "<b>given</b> · <code>unmasked_index</code> marks the prompt tokens that will be hidden in the unconditional pass (purple). Tokens listed in <code>cfg_keep_tokens</code> stay visible."; viz = lbl("x  (purple = will be hidden)") + chips(cx.map((c, k) => (k < prompt.length && given[k] ? { t: c.t, c: "att" } : c))); w = [["unmasked_index", `[${given.map((g) => (g ? 1 : 0)).join(", ")}]`, "1 = hidden in un_x"]]; tags = ["given"]; }
+    else if (f === "hide") { cap = "<b>hide</b> · the unconditional input <code>un_x</code> is the same canvas with those prompt tokens replaced by <code>[MASK]</code>: the model now predicts with no prompt."; viz = lbl("x (conditional)") + chips(cx) + lbl("un_x (unconditional)") + chips(ux); w = [["un_x", `[B, T]`, `${given.filter(Boolean).length} prompt tokens masked`]]; tags = ["hide"]; }
+    else if (f === "batch") { cap = "<b>batch</b> · both canvases go through the model as <em>one</em> batch of 2B, and the logits are split back into a conditional and an unconditional half."; viz = lbl("x_ = cat([x, un_x])  →  [2B, T]") + chips(cx) + chips(ux) + lbl("logits → chunk(2) → logits (cond), un_logits"); w = [["x_", "[2B, T]"], ["logits", "[2B, T, V]", "→ two [B, T, V] halves"]]; tags = ["batch"]; }
+    else if (f === "logits") { cap = "<b>logits</b> · scores for the first masked position from each half. With the prompt the model prefers <b>" + labels[top(cond)] + "</b>; without it it prefers <b>" + labels[top(un)] + "</b>."; viz = lbl("logits (conditional: prompt visible)") + svgBars(cond, { labels, hi: top(cond) }) + lbl("un_logits (unconditional: prompt hidden)") + svgBars(un, { labels, hi: top(un), color: "var(--c3)" }); w = [["logits", list(cond)], ["un_logits", list(un)]]; tags = ["batch"]; }
+    else { cap = `<b>mix</b> · <code>un + (s+1)·(cond − un)</code> with s = <b>${s}</b>, i.e. <code>cond + s·(cond − un)</code>: push the scores further in the direction the prompt moved them. P(<b>${labels[top(mixed)]}</b>) goes from ${(pc[top(mixed)] * 100).toFixed(0)}% to ${(pm[top(mixed)] * 100).toFixed(0)}%.`;
+      viz = lbl("cond") + svgBars(cond, { labels, color: "var(--c1)" }) + lbl(`guided = un + (${s}+1)·(cond − un)`) + svgBars(mixed, { labels, hi: top(mixed), color: "var(--c3)" }); w = [["cfg_scale", s], ["guided", list(mixed)], ["P(top) cond → guided", `${(pc[top(mixed)] * 100).toFixed(1)}% → ${(pm[top(mixed)] * 100).toFixed(1)}%`]]; tags = ["mix"]; }
+    $c("cap").innerHTML = cap; $c("viz").innerHTML = viz; watch($c("watch"), w); cp.hl(tags);
+  },
+};
+
+/* =========================================================
+   right_shift_logits
+   ========================================================= */
+const CODE_SHIFT = `# empty prompts get a [BOS], so that column 0 exists
+@bos|if right_shift_logits:
+@bos|    inputs = [[bos_id] if len(p) == 0 else p for p in inputs]
+
+def _window_logits(logits, c0, c1, right_shift):
+@win|    if not right_shift:
+@win|        return logits[:, c0:c1]
+@shift|    src = torch.arange(c0 - 1, c1 - 1).clamp(min=0)   # column i uses column i-1
+@shift|    return logits[:, src]`;
+const SHIFT = {
+  code: CODE_SHIFT, title: "mdlm.py · _window_logits", ctl: "ctl_shift",
+  build() {
+    this.on = $c("s_on").checked; this.P = +$c("s_P").value; this.N = +$c("s_N").value; this.bs = +$c("s_bs").value;
+    const nb = Math.ceil(this.N / this.bs); $c("s_b").max = nb - 1; this.b = Math.min(+$c("s_b").value, nb - 1);
+    this.T = this.P + this.N; this.c0 = this.P + this.b * this.bs; this.c1 = Math.min(this.c0 + this.bs, this.T);
+    this.frames = ["raw", "shift", "window"];
+  },
+  show(i) {
+    const f = this.frames[i], { on, P, T, c0, c1 } = this, cw = Math.max(20, Math.min(40, Math.floor(($c("viz").clientWidth || 520) / T) - 2));
+    const src = (k) => (on ? Math.max(k - 1, 0) : k);
+    let canvas = "", raw = "", used = "";
+    for (let k = 0; k < T; k++) {
+      canvas += `<div class="cell ${k < P ? "prompt" : "mask"}" style="height:26px">${k < P ? "P" : ""}</div>`;
+      raw += `<div class="cell" style="height:26px;font-size:10px;background:var(--code)" data-tip="output at column ${k}">o${k}</div>`;
+      const inW = k >= c0 && k < c1, shown = f !== "raw";
+      used += `<div class="cell ${inW && f === "window" ? "sel" : ""}" style="height:26px;font-size:10px;background:${shown ? (inW ? "color-mix(in srgb,var(--c4) 30%,var(--surface))" : "var(--code)") : "transparent"};${shown ? "" : "border:1px dotted var(--line)"}">${shown ? "o" + src(k) : ""}</div>`;
+    }
+    const row = (lab, cells) => `<div class="seq" style="--T:${T};--cw:${cw}px;margin-bottom:8px"><div class="lab">${lab}</div><div class="row">${cells}</div></div>`;
+    $c("viz").innerHTML = row("canvas (prompt · masks)", canvas) + row(on ? "model output o[i]  — trained to predict token i+1" : "model output o[i]  — predicts token i", raw) + row(f === "raw" ? "logits used for column i" : `logits used for column i = o[${on ? "max(i−1, 0)" : "i"}]`, used) +
+      `<div class="row win" style="--T:${T};--cw:${cw}px;display:grid;grid-template-columns:repeat(${T},${cw}px);gap:2px"><div style="grid-column:${c0 + 1}/${c1 + 1};background:var(--c3)"></div></div><div class="mini">green = the block being decoded, columns ${c0}…${c1 - 1}</div>`;
+    const cap = { raw: on ? `<b>raw</b> · a model initialised from an autoregressive checkpoint keeps its habit: the output at column <i>i</i> is a prediction for token <i>i+1</i>.` : `<b>raw</b> · with <code>right_shift_logits = False</code> the output at column <i>i</i> is used for token <i>i</i> — the usual masked-diffusion convention.`,
+      shift: on ? `<b>shift</b> · to predict token <i>i</i> we therefore need the output from column <i>i−1</i>: everything moves one place right (column 0 keeps its own).` : `<b>shift</b> · no shift: each column uses its own output.`,
+      window: on ? `<b>window</b> · only columns ${c0}…${c1 - 1} are needed, so <code>src = arange(c0−1, c1−1)</code> = <b>${c0 - 1} … ${c1 - 2}</b>. The first masked column uses the output of the token just before it.` : `<b>window</b> · only columns ${c0}…${c1 - 1} are sliced: <code>logits[:, c0:c1]</code>.` }[f];
+    $c("cap").innerHTML = cap;
+    watch($c("watch"), { raw: [["T", T], ["prompt / new", `${P} / ${T - P}`]], shift: [["column i uses", on ? "o[max(i−1, 0)]" : "o[i]"]], window: [["c0, c1", `${c0}, ${c1}`], ["src", on ? `[${Array.from({ length: c1 - c0 }, (_, k) => Math.max(c0 - 1 + k, 0)).join(", ")}]` : "c0:c1 (slice)"]] }[f]);
+    cp.hl(f === "raw" ? ["bos"] : on ? ["win", "shift"] : ["win"]);
+  },
+};
+
+/* =========================================================
+   suppress_tokens / begin_suppress_tokens
+   ========================================================= */
+const CODE_SUP = `if suppress_ids is not None:
+@sup|    logits[:, :, suppress_ids] = -torch.inf          # BEFORE argmax: can never be chosen
+
+@arg|x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1)
+
+if begin_suppress_ids is not None:
+@bsup|    logits[:, :, begin_suppress_ids] = -torch.inf   # AFTER argmax: x0 is already fixed
+
+@conf|p = F.softmax(logits, dim=-1)
+@conf|x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)   # confidence of the chosen token`;
+const SUP_TOK = ["the", "cat", "sat", "mat", "<eos>", "<pad>"];
+const SUPPRESS = {
+  code: CODE_SUP, title: "mdlm.py · one decoding step", ctl: "ctl_suppress",
+  build() {
+    this.logits = nums($c("u_logits").value).slice(0, 6); while (this.logits.length < 6) this.logits.push(0);
+    const ids = (v) => v.split(",").map((z) => SUP_TOK.indexOf(z.trim())).filter((k) => k >= 0);
+    this.sup = ids($c("u_sup").value); this.bsup = ids($c("u_bsup").value);
+    this.l1 = this.logits.map((v, k) => (this.sup.includes(k) ? -Infinity : v));
+    this.x0 = this.l1.indexOf(Math.max(...this.l1));
+    this.l2 = this.l1.map((v, k) => (this.bsup.includes(k) ? -Infinity : v));
+    this.p = softmax(this.l2); this.conf = this.p[this.x0];
+    this.frames = ["logits", "sup", "arg", "bsup", "conf"];
+  },
+  show(i) {
+    const f = this.frames[i], { logits, l1, l2, x0, conf, sup, bsup, p } = this, L = SUP_TOK;
+    const nm = (a) => a.length ? a.map((k) => L[k]).join(", ") : "none", E = (t) => _esc(String(t));
+    let cap = "", viz = "", w = [], tags = [];
+    if (f === "logits") { cap = "<b>logits</b> · the model's scores for one position. <code>&lt;eos&gt;</code> is the favourite here."; viz = lbl("logits") + svgBars(logits, { labels: L, hi: logits.indexOf(Math.max(...logits)) }); w = [["suppress_tokens", nm(sup)], ["begin_suppress_tokens", nm(bsup)]]; }
+    else if (f === "sup") { cap = `<b>suppress_tokens</b> · <code>logits[..., ids] = −inf</code> <em>before</em> the argmax: <b>${E(nm(sup))}</b> can never be proposed.`; viz = lbl("logits after suppress_tokens") + svgBars(l1, { labels: L }); w = [["suppress_ids", `[${sup.join(", ")}]`, nm(sup)]]; tags = ["sup"]; }
+    else if (f === "arg") { cap = `<b>argmax</b> · the proposed token is <b>${E(L[x0])}</b>, chosen from the logits <em>after</em> <code>suppress_tokens</code> but <em>before</em> <code>begin_suppress_tokens</code> is applied.`; viz = lbl("logits used for the argmax") + svgBars(l1, { labels: L, hi: x0 }); w = [["x0", L[x0]]]; tags = ["arg"]; }
+    else if (f === "bsup") { cap = `<b>begin_suppress_tokens</b> · <code>−inf</code> is written <em>after</em> <code>x0</code> was chosen, so it does not change <code>x0</code>. It only changes the probabilities used for the confidence next.`; viz = lbl("logits after begin_suppress_tokens (x0 already fixed)") + svgBars(l2, { labels: L, hi: bsup.includes(x0) ? [] : x0 }); w = [["begin_suppress_ids", `[${bsup.join(", ")}]`, nm(bsup)], ["x0", L[x0], "unchanged"]]; tags = ["bsup"]; }
+    else { const banned = bsup.includes(x0); cap = banned ? `<b>confidence</b> · x0 = <b>${E(L[x0])}</b> is in <code>begin_suppress_tokens</code>, so its probability is now <b>0</b>: it is ranked last for this step, but it is still eligible — if the step needs more tokens than there are better candidates, it is still committed.` : `<b>confidence</b> · <code>softmax(logits)</code> at x0 = <b>${E(L[x0])}</b> gives confidence ${conf.toFixed(3)}; positions are ranked by this number.`;
+      viz = lbl("softmax(logits) — the confidence of x0 is the highlighted bar") + svgBars(p, { labels: L, hi: x0, fmt: (z) => z.toFixed(3) }); w = [["x0_p", conf.toFixed(4), banned ? "0 → ranked last" : "used for ranking"]]; tags = ["conf"]; }
+    $c("cap").innerHTML = cap; $c("viz").innerHTML = viz; watch($c("watch"), w); cp.hl(tags);
+  },
+};
+
+/* =========================================================
+   remasking: low_confidence vs random
+   ========================================================= */
+const CODE_REMASK = `@lc|if remasking == "low_confidence":
+@lc|    p = F.softmax(logits, dim=-1)
+@lc|    x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)   # how sure the model is
+@rnd|elif remasking == "random":
+@rnd|    x0_p = torch.rand((B, T), device=x.device)[:, c0:c1]       # ignores the model
+
+@pick|confidence = torch.where(mask_w & window_w, x0_p, -torch.inf)
+@pick|transfer_index = topk_transfer_mask(confidence, k, k_max)     # top-k of the scores`;
+const REMASK = {
+  code: CODE_REMASK, title: "mdlm.py · confidence scores", ctl: "ctl_remask", seed: 3,
+  build() {
+    const W = +$c("r_W").value, rnd = mulberry32(this.seed); $c("r_k").max = W; this.W = W; this.k = Math.min(+$c("r_k").value, W);
+    this.lc = Array.from({ length: W }, () => Math.pow(rnd(), 2.2)); this.rd = Array.from({ length: W }, () => rnd());
+    const top = (a) => a.map((v, i) => [v, i]).sort((x, y) => y[0] - x[0]).slice(0, this.k).map((z) => z[1]);
+    this.tl = top(this.lc); this.tr = top(this.rd); this.overlap = this.tl.filter((i) => this.tr.includes(i)).length;
+    this.frames = ["lc", "rnd", "pick"];
+  },
+  show(i) {
+    const f = this.frames[i], { W, k, lc, rd, tl, tr, overlap } = this, labels = Array.from({ length: W }, (_, j) => j), fm = (z) => z.toFixed(2).replace(/^0/, "");
+    const b = (a, hi, col) => svgBars(a, { labels, hi, color: col, fmt: fm, W: 560 });
+    let cap = "", viz = "", w = [], tags = [];
+    if (f === "lc") { cap = "<b>low_confidence</b> · each masked position is scored by how sure the model is about its proposed token (the softmax probability). Sure positions get committed first; unsure ones stay masked and are tried again next step."; viz = lbl(`x0_p — model confidence at W = ${W} candidate positions`) + b(lc, [], "var(--c1)"); w = [["x0_p", `[B, ${W}]`, "probability of x0"]]; tags = ["lc"]; }
+    else if (f === "rnd") { cap = "<b>random</b> · the model's confidence is ignored: every position gets a uniform random score, so the choice of <i>which</i> tokens to commit is random (the predicted tokens themselves are the same)."; viz = lbl("x0_p — random scores") + b(rd, [], "var(--c3)"); w = [["x0_p", `[B, ${W}]`, "torch.rand"]]; tags = ["rnd"]; }
+    else { cap = `<b>pick</b> · with k = ${k}, the same <code>topk_transfer_mask</code> keeps the k highest scores. Here the two strategies agree on <b>${overlap}</b> of ${k} positions.`; viz = lbl("low_confidence: top-k highlighted") + b(lc, tl, "var(--c1)") + lbl("random: top-k highlighted") + b(rd, tr, "var(--c3)"); w = [["k", k], ["agree", `${overlap} / ${k}`, "positions picked by both"]]; tags = ["pick"]; }
+    $c("cap").innerHTML = cap; $c("viz").innerHTML = viz; watch($c("watch"), w); cp.hl(tags);
+  },
+};
+
+/* =========================================================
+   tabs + shared stepper
+   ========================================================= */
+const MODS = { cfg: CFG, shift: SHIFT, suppress: SUPPRESS, remask: REMASK };
+let curMod = "cfg", cp = null;
+const st = stepper($c("stp"), (i) => { const M = MODS[curMod]; if (M.frames && M.frames[i] !== undefined) M.show(i); }, 800);
+function activate(name, keep) {
+  curMod = name; const M = MODS[name];
+  for (const k in MODS) { $c("ctl_" + k).hidden = k !== name; $c("tab_" + k).classList.toggle("on", k === name); }
+  $c("code").innerHTML = ""; cp = codePanel($c("code"), M.title, M.code);
+  M.build(); st.setN(M.frames.length, keep);
+}
+for (const k in MODS) $c("tab_" + k).onclick = () => activate(k, false);
+const rebuild = () => { MODS[curMod].build(); st.setN(MODS[curMod].frames.length, true); };
+["c_keep", "c_cond", "c_un", "s_on", "u_logits", "u_sup", "u_bsup"].forEach((id) => $c(id).addEventListener("input", rebuild));
+["c_s", "s_P", "s_N", "s_bs", "s_b", "r_W", "r_k"].forEach((id) => bindRange(id, rebuild));
+$c("r_re").onclick = () => { REMASK.seed++; rebuild(); };
+activate(["cfg", "shift", "suppress", "remask"].includes(EMBED) ? EMBED : "cfg", false);
+</script>
+</main></body></html>

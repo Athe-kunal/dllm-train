@@ -175,10 +175,8 @@ function barChart(host, o) {
   const bw = (W - m.l - m.r) / n;
   const sy = (v) => H - m.b - (v / ymax) * (H - m.t - m.b);
   let g = "";
-  for (let i = 0; i <= 4; i++) {
-    const v = (ymax * i) / 4;
-    g += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${sy(v)}" y2="${sy(v)}"/><text x="${m.l - 6}" y="${sy(v) + 4}" text-anchor="end">${Math.round(v)}</text>`;
-  }
+  const top = Math.max(1, ...o.vals, ...(o.line || [0])), tstep = top <= 4 ? 1 : Math.ceil(top / 4);
+  for (let v = 0; v <= top + 1e-9; v += tstep) g += `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${sy(v)}" y2="${sy(v)}"/><text x="${m.l - 6}" y="${sy(v) + 4}" text-anchor="end">${v}</text>`;
   const every = Math.max(1, Math.ceil(n / 16));
   o.vals.forEach((v, i) => {
     const x = m.l + i * bw;
@@ -207,7 +205,7 @@ function bindRange(id, cb) {
 }
 function navHtml(active) {
   if (EMBED !== null) return "";
-  const items = [["index.html", "Overview"], ["schedulers.html", "Schedulers"], ["utils.html", "samplers/utils"], ["mdlm.html", "MDLM sampler"], ["bd3lm.html", "BD3LM sampler"], ["training.html", "Training"]];
+  const items = [["index.html", "Overview"], ["schedulers.html", "Schedulers"], ["utils.html", "samplers/utils"], ["mdlm.html", "MDLM sampler"], ["bd3lm.html", "BD3LM sampler"], ["training.html", "Training"], ["options.html", "Decoding options"], ["reveal_order.html", "Reveal order"], ["compare.html", "MDLM vs BD3LM"], ["tensors.html", "Tensor sizes"]];
   return `<nav class="top">${items.map(([h, t]) => `<a href="${h}" class="${h === active ? "on" : ""}">${t}</a>`).join("")}</nav>`;
 }
 
@@ -258,4 +256,25 @@ function stepper(host, onFrame, ms = 650) {
   const hashF = (/f=(\d+)/.exec(location.hash || "") || [])[1];
   let first = true;
   return { setN(m, keep) { n = m; rng.max = m - 1; const start = first && hashF !== undefined ? +hashF : keep ? Math.min(cur, m - 1) : 0; first = false; set(start); }, get: () => cur };
+}
+
+// ---------- svg bar chart for a few values (logits, probabilities …) ----------
+// o: {labels, hi (index or [indices]), color, colors[], fmt}. Non-finite values draw a dashed "−inf" stub.
+const _LET = "ABCDEFGH";
+function svgBars(vals, o = {}) {
+  const W = o.W || 460, H = 165, pad = 40, n = vals.length, fin = vals.filter(isFinite), mn = Math.min(0, ...fin), mx = Math.max(0.0001, ...fin);
+  const sy = (v) => 12 + ((mx - v) / (mx - mn || 1)) * (H - pad - 12), bw = (W - 20) / n, labels = o.labels || [..._LET], hi = [].concat(o.hi === undefined ? [] : o.hi);
+  let g = `<line class="axis" x1="10" x2="${W - 10}" y1="${sy(0)}" y2="${sy(0)}"/>`;
+  vals.forEach((v, i) => {
+    const x = 10 + i * bw + bw * 0.15, w = bw * 0.7, y0 = sy(0), on = hi.includes(i);
+    if (isFinite(v)) {
+      const y1 = sy(v);
+      g += `<rect x="${x}" y="${Math.min(y0, y1)}" width="${w}" height="${Math.max(1, Math.abs(y1 - y0))}" rx="3" fill="${on ? "var(--c2)" : (o.colors && o.colors[i]) || o.color || "var(--c1)"}"/>`;
+      g += `<text x="${x + w / 2}" y="${v >= 0 ? y1 - 4 : y1 + 13}" text-anchor="middle" style="font-size:10.5px">${(o.fmt || ((z) => z.toFixed(2)))(v)}</text>`;
+    } else {
+      g += `<rect x="${x}" y="${y0 - 14}" width="${w}" height="14" rx="3" fill="none" stroke="var(--c2)" stroke-dasharray="3 2"/><text x="${x + w / 2}" y="${y0 - 18}" text-anchor="middle" style="font-size:10.5px">−inf</text>`;
+    }
+    g += `<text x="${x + w / 2}" y="${H - 8}" text-anchor="middle" style="font-size:11.5px;fill:var(--ink2)">${_esc(String(labels[i]))}</text>`;
+  });
+  return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" style="max-width:${W + 40}px">${g}</svg></div>`;
 }

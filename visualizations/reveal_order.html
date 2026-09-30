@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reveal order — where tokens land</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("reveal_order.html"))</script>
+
+<h1>Reveal order</h1>
+<p class="sub">In which order does MDLM decoding commit the positions? Each cell is the <b>average step at which a position was committed</b>, over 300 simulated runs, using the real block windows, scheduler counts and top-k. Compare two settings.</p>
+
+<div class="panel">
+  <div class="controls">
+    <label>max_new_tokens <input type="range" id="N" min="8" max="48" value="32"><output id="N_o"></output></label>
+    <label>steps <input type="range" id="steps" min="1" max="48" value="16"><output id="steps_o"></output></label>
+    <label>scheduler <select id="sched"><option value="linear">Linear</option><option value="cosine">Cosine</option></select></label>
+    <label><span>model is very sure about the far end (EOS-like tail)</span><input type="checkbox" id="tail" checked></label>
+    <button id="re">draw another run</button>
+  </div>
+  <div class="mini" style="margin-top:10px">The model is synthetic: confidence is higher next to already-known tokens (locality), optionally very high in the last quarter of the canvas. It shows what the <i>sampler</i> does with such scores, not how a trained model behaves.</div>
+</div>
+
+<div id="panels"></div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+const R = 300, P = 4;
+let single = 0;
+const CFGS = [{ key: "A", bs: 8, rm: "low_confidence" }, { key: "B", bs: 48, rm: "low_confidence" }];
+
+// one simulated decode of a single row: returns the commit step (0-based forward index) of each generated position
+function run(N, bs, steps, S, remask, tail, rnd) {
+  const T = P + N, st = new Array(T).fill(0).map((_, p) => (p < P ? 0 : 1)), when = new Array(N).fill(-1);
+  const nb = Math.ceil(N / bs), spb = Math.ceil(steps / nb), ks = [];
+  let g = 0;
+  for (let b = 0; b < nb; b++) {
+    const lo = P + b * bs, hi = Math.min(P + N, lo + bs);
+    const nt = numTransfer([hi - lo], bs === 0 ? 1 : spb, S, false, rnd).packed[0];
+    for (const k of nt) {
+      const cand = [];
+      for (let p = lo; p < hi; p++) if (st[p] === 1) {
+        let c;
+        if (remask === "random") c = rnd();
+        else {
+          const known = (p > 0 && st[p - 1] !== 1) || (p < T - 1 && st[p + 1] !== 1);
+          c = 0.15 * rnd() + 0.85 * rnd() * (known ? 1 : 0.35);
+          if (tail && p - P >= N * 0.75) c = 0.75 + 0.25 * rnd();
+        }
+        cand.push([c, p]);
+      }
+      cand.sort((a, z) => z[0] - a[0]);
+      for (const [, p] of cand.slice(0, k)) { st[p] = 2; when[p - P] = g; }
+      ks.push(Math.min(k, cand.length)); g++;
+    }
+  }
+  return { when, forwards: g, ks };
+}
+
+function renderPanel(cfg, N, steps, S, tail, seedBase) {
+  const rnd = mulberry32(1000 + seedBase), sum = new Array(N).fill(0);
+  let F = 0, ksOne = [];
+  for (let r = 0; r < R; r++) { const o = run(N, cfg.bs, steps, S, cfg.rm, tail, rnd); o.when.forEach((w, i) => (sum[i] += w)); F = o.forwards; }
+  const one = run(N, cfg.bs, steps, S, cfg.rm, tail, mulberry32(7000 + single * 13 + seedBase));
+  ksOne = one.ks;
+  const mean = sum.map((v) => v / R), width = ($c("panels").clientWidth || 900) - 40, cw = Math.max(12, Math.min(28, Math.floor(width / (N + P)) - 2));
+  const cells = (arr, f) => arr.map((v, i) => `<div class="cell done ${f(v) > 0.55 ? "dark" : ""}" style="--f:${f(v)};${i % cfg.bs === 0 && cfg.bs < N ? "box-shadow:inset 2px 0 0 var(--ink2);" : ""}" data-tip="position ${i} · ${typeof v === "number" ? (Number.isInteger(v) ? "committed at step " + v : "average step " + v.toFixed(1)) : ""}">${Math.round(v)}</div>`).join("");
+  const prompt = `<div class="cell prompt">P</div>`.repeat(P);
+  const norm = (v) => (F > 1 ? v / (F - 1) : 0);
+  return `<div class="panel" style="margin-top:14px">
+    <div class="controls" style="margin-bottom:10px"><b style="align-self:center">${cfg.key}</b>
+      <label>block_size <input type="range" data-k="${cfg.key}" data-f="bs" min="1" max="48" value="${cfg.bs}"><output>${Math.min(cfg.bs, N)}</output></label>
+      <label>remasking <select data-k="${cfg.key}" data-f="rm"><option value="low_confidence" ${cfg.rm === "low_confidence" ? "selected" : ""}>low_confidence</option><option value="random" ${cfg.rm === "random" ? "selected" : ""}>random</option></select></label>
+      <span class="stat" style="margin:0"><b>${F}</b><span>forward passes</span></span></div>
+    <div class="seq" style="--T:${N + P};--cw:${cw}px"><div class="lab">average commit step over ${R} runs (light = early, dark = late; vertical bar = block start)</div><div class="row">${prompt}${cells(mean, norm)}</div>
+      <div class="lab" style="margin-top:8px">one run</div><div class="row">${prompt}${cells(one.when, norm)}</div></div>
+    <div class="mini" style="margin-top:10px">tokens committed at each forward pass (from the scheduler, across the blocks)</div><div id="k_${cfg.key}" style="max-width:640px"></div></div>`;
+}
+
+function render() {
+  const N = +$c("N").value, steps = +$c("steps").value, S = ALPHA[$c("sched").value], tail = $c("tail").checked;
+  $c("panels").innerHTML = CFGS.map((c, i) => renderPanel({ ...c, bs: Math.min(c.bs, N) }, N, steps, S, tail, i)).join("");
+  CFGS.forEach((c, i) => {
+    const bs = Math.min(c.bs, N), o = run(N, bs, steps, S, c.rm, tail, mulberry32(7000 + single * 13 + i));
+    barChart($c("k_" + c.key), { vals: o.ks, labelX: "forward pass", tipFor: (j) => `forward ${j}: commit ${o.ks[j]} tokens` });
+  });
+  $$("#panels [data-k]").forEach((el) => el.addEventListener(el.type === "range" ? "change" : "input", () => {
+    const c = CFGS.find((z) => z.key === el.dataset.k); if (el.dataset.f === "bs") c.bs = +el.value; else c.rm = el.value; render();
+  }));
+}
+["sched", "tail"].forEach((id) => $c(id).addEventListener("input", render));
+bindRange("N", render); bindRange("steps", render);
+$c("re").onclick = () => { single++; render(); };
+render();
+</script>
+</main></body></html>

@@ -206,16 +206,6 @@ const CODE_GUMBEL = `def add_gumbel_noise(logits, temperature):
 
 # in the sampler:
 @pick|x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1)`;
-function svgBars(vals, o = {}) {
-  const W = 460, H = 165, pad = 40, n = vals.length, mn = Math.min(0, ...vals), mx = Math.max(0.0001, ...vals), sy = (v) => 12 + ((mx - v) / (mx - mn || 1)) * (H - pad - 12), bw = (W - 20) / n;
-  let g = `<line class="axis" x1="10" x2="${W - 10}" y1="${sy(0)}" y2="${sy(0)}"/>`;
-  vals.forEach((v, i) => {
-    const x = 10 + i * bw + bw * 0.15, w = bw * 0.7, y0 = sy(0), y1 = sy(v), on = o.hi === i;
-    g += `<rect x="${x}" y="${Math.min(y0, y1)}" width="${w}" height="${Math.max(1, Math.abs(y1 - y0))}" rx="3" fill="${on ? "var(--c2)" : o.color || "var(--c1)"}"/>`;
-    g += `<text x="${x + w / 2}" y="${H - 8}" text-anchor="middle" style="font-size:12px;fill:var(--ink2)">${TOK[i]}</text><text x="${x + w / 2}" y="${(v >= 0 ? y1 - 4 : y1 + 13)}" text-anchor="middle" style="font-size:10.5px">${(o.fmt || ((z) => z.toFixed(2)))(v)}</text>`;
-  });
-  return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" style="max-width:${W + 40}px">${g}</svg></div>`;
-}
 function softmaxT(l, T) { const z = l.map((v) => v / T), m = Math.max(...z), e = z.map((v) => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s); }
 const GUMBEL = {
   code: CODE_GUMBEL, title: "dllm/core/samplers/utils.py · add_gumbel_noise", ctl: "ctl_gumbel", seed: 2,

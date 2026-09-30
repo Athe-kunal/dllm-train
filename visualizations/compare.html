@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MDLM vs BD3LM — side by side</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("compare.html"))</script>
+
+<h1>MDLM vs BD3LM</h1>
+<p class="sub">The same prompt, block size and steps. Both commit the same tokens at every step; what differs is <b>what the model has to read</b>. Step with ← →</p>
+
+<div class="panel">
+  <div class="controls">
+    <label>prompt length <input type="range" id="P" min="1" max="12" value="6"><output id="P_o"></output></label>
+    <label>max_new_tokens <input type="range" id="N" min="8" max="40" value="16"><output id="N_o"></output></label>
+    <label>block_size <input type="range" id="bs" min="2" max="16" value="4"><output id="bs_o"></output></label>
+    <label>steps <input type="range" id="steps" min="1" max="32" value="8"><output id="steps_o"></output></label>
+  </div>
+  <div id="stp" style="margin-top:12px"></div>
+</div>
+
+<div class="cap" id="cap" style="margin-top:14px"></div>
+<div class="grid2">
+  <div class="panel"><h3 style="margin:0 0 6px">MDLM</h3><div class="seqs" id="vm"></div></div>
+  <div class="panel"><h3 style="margin:0 0 6px">BD3LM</h3><div class="seqs" id="vb"></div></div>
+</div>
+<div class="panel" style="margin-top:14px">
+  <div id="stats"></div>
+  <div class="mini" style="margin-top:8px">tokens pushed through the model, cumulative — the dots mark the current step</div>
+  <div id="ch" style="max-width:720px"></div>
+</div>
+<div class="legend" style="margin-top:10px">
+  <span><i class="sw" style="background:var(--prompt)"></i>prompt</span>
+  <span><i class="sw" style="border:1px dashed var(--c2)"></i>masked</span>
+  <span><i class="sw" style="background:color-mix(in srgb,var(--c1) 40%,var(--surface))"></i>committed</span>
+  <span><i class="sw" style="background:var(--pad);border:1px dashed var(--line2)"></i>left pad (BD3LM)</span>
+  <span><i class="sw" style="background:color-mix(in srgb,var(--c4) 38%,var(--surface))"></i>in the KV cache</span>
+  <span><i class="sw" style="background:color-mix(in srgb,var(--c1) 55%,var(--surface))"></i>goes through the model this step</span>
+  <span><i class="sw" style="background:var(--c3);height:4px"></i>block being decoded</span>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+let F = [], M = {};
+
+function simulate(cfg) {
+  const rnd = mulberry32(4), S = ALPHA.linear, { P, N, bs } = cfg, nb = Math.ceil(N / bs), spb = Math.ceil(cfg.steps / nb);
+  const T = P + N, padded = Math.ceil(P / bs) * bs, pad = padded - P, Tb = padded + N;
+  const mst = Array.from({ length: T }, (_, p) => (p < P ? 0 : 1)), mcs = new Array(T).fill(-1);
+  const bst = [...new Array(pad).fill(4), ...new Array(P).fill(0)], bcs = new Array(Tb).fill(-1);
+  let g = 0, mTok = 0, bTok = padded;
+  const cumM = [0], cumB = [padded];
+  const snap = (x) => ({ mst: mst.slice(), mcs: mcs.slice(), bst: bst.slice(), bcs: bcs.slice(), g, mTok, bTok, ...x });
+  const out = [snap({ kind: "init", cache: padded, cl: 0 })];
+  for (let b = 0; b < nb; b++) {
+    const lo = P + b * bs, hi = Math.min(P + N, lo + bs), cl = hi - lo, blo = padded + b * bs;
+    for (let i = 0; i < cl; i++) bst.push(1);
+    const nt = numTransfer([cl], spb, S, false, rnd).packed[0];
+    for (let i = 0; i < nt.length; i++) {
+      // same commits in both decoders: rank the block's masked positions by one shared confidence
+      const cand = [];
+      for (let j = 0; j < cl; j++) if (mst[lo + j] === 1) {
+        const known = j === 0 || mst[lo + j - 1] !== 1;
+        cand.push([0.2 * rnd() + 0.8 * rnd() * (known ? 1 : 0.35), j]);
+      }
+      cand.sort((a, z) => z[0] - a[0]);
+      const sel = cand.slice(0, nt[i]).map((c) => c[1]);
+      for (const j of sel) { mst[lo + j] = 3; mcs[lo + j] = g; bst[blo + j] = 3; bcs[blo + j] = g; }
+      g++; mTok += T; bTok += cl;
+      const last = i === nt.length - 1 && b < nb - 1; if (last) bTok += cl;
+      cumM.push(mTok); cumB.push(bTok);
+      out.push(snap({ kind: "step", b, nb, cl, lo, hi, blo, cache: padded + b * bs, sel, eff: nt.length, ext: last }));
+    }
+  }
+  return { frames: out, meta: { P, N, bs, T, padded, Tb, nb, total: g, cumM, cumB } };
+}
+
+function build() {
+  const cfg = { P: +$c("P").value, N: +$c("N").value, bs: +$c("bs").value, steps: +$c("steps").value };
+  const r = simulate(cfg); F = r.frames; M = r.meta; st.setN(F.length, true);
+}
+
+const cellsRow = (states, cs, total, cw, extra) => states.map((s, p) => {
+  let cls = "cell", txt = "";
+  if (s === undefined) cls += " none"; else if (s === 4) { cls += " pad"; txt = "·"; } else if (s === 0) { cls += " prompt"; txt = "P"; } else if (s === 1) cls += " mask";
+  else { cls += " done" + (cs[p] / total > 0.55 ? " dark" : ""); txt = cs[p]; }
+  return `<div class="${cls}" style="--f:${s === 3 ? cs[p] / total : 0};${extra ? extra(p) : ""}">${txt}</div>`;
+}).join("");
+const strip = (T, fn, label, cw) => `<div class="seq" style="--T:${T};--cw:${cw}px;margin-top:8px"><div class="lab">${label}</div><div class="row">${Array.from({ length: T }, (_, p) => `<div class="cell ${fn(p)}" style="height:16px"></div>`).join("")}</div></div>`;
+
+function show(i) {
+  const f = F[i], { P, T, padded, Tb, total, cumM, cumB } = M, tot = Math.max(1, total);
+  const cw = (n) => Math.max(9, Math.min(26, Math.floor((($c("vm").clientWidth || 480)) / n) - 2));
+  // ---- MDLM ----
+  const cwm = cw(T), inM = f.kind === "step";
+  let hm = `<div class="seq" style="--T:${T};--cw:${cwm}px"><div class="lab">canvas — all ${T} columns exist from the start</div><div class="row">${cellsRow(f.mst, f.mcs, tot, cwm)}</div>` +
+    (inM ? `<div class="row win"><div style="grid-column:${f.lo + 1}/${f.hi + 1}"></div></div>` : "") + "</div>";
+  hm += strip(T, () => (inM ? "rd" : "none"), inM ? `through the model this step: ${T} columns` : "through the model: —", cwm);
+  hm += strip(T, () => "none", "KV cache: none possible (bidirectional attention)", cwm);
+  $c("vm").innerHTML = hm;
+  // ---- BD3LM ----
+  const cwb = cw(Tb), len = f.bst.length, states = Array.from({ length: Tb }, (_, p) => (p < len ? f.bst[p] : undefined));
+  let hb = `<div class="seq" style="--T:${Tb};--cw:${cwb}px"><div class="lab">canvas — grows one block at a time</div><div class="row">${cellsRow(states, f.bcs, tot, cwb)}</div>` +
+    (inM ? `<div class="row win"><div style="grid-column:${f.blo + 1}/${f.blo + f.cl + 1}"></div></div>` : "") + "</div>";
+  hb += strip(Tb, (p) => (inM && p >= f.blo && p < f.blo + f.cl ? "rd" : !inM && p >= 0 && p < padded ? "rd" : "none"), inM ? `through the model this step: ${f.cl} columns` : `through the model: prompt prefill (${padded} columns)`, cwb);
+  hb += strip(Tb, (p) => (p < f.cache ? "kv" : "none"), `KV cache: ${f.cache} tokens` + (f.ext ? " → the finished block is added next" : ""), cwb);
+  $c("vb").innerHTML = hb;
+
+  $c("cap").innerHTML = f.kind === "init"
+    ? `<b>start</b> · MDLM has the whole canvas of masks ready. BD3LM has only the prompt (left-padded to a whole block); it encodes it once (${padded} tokens) to fill its cache. Press ▶ or →.`
+    : `<b>step ${f.g}/${total}</b> · block ${f.b + 1}/${f.nb}. Same tokens committed in both. MDLM pushes all <b>${T}</b> columns through the model; BD3LM pushes only the <b>${f.cl}</b> block columns and reads a cache of <b>${f.cache}</b> tokens${f.ext ? ` (then the finished block is added to the cache: ${f.cl} more tokens through the model)` : ""}.`;
+  const stat = (v, l) => `<span class="stat"><b>${v}</b><span>${l}</span></span>`;
+  $c("stats").innerHTML = stat(f.kind === "step" ? T : "—", "MDLM: tokens through the model this step") + stat(f.kind === "step" ? f.cl : padded, "BD3LM: tokens through the model this step" + (f.kind === "step" ? "" : " (prompt prefill)")) +
+    stat(f.mTok.toLocaleString(), "MDLM so far") + stat(f.bTok.toLocaleString(), "BD3LM so far");
+  lineChart($c("ch"), { xs: cumM.map((_, k) => k), xname: "step", xlabel: "decoding step", ylabel: "tokens", fmtX: (v) => Math.round(v), fmtY: (v) => Math.round(v).toLocaleString(), xticks: Math.min(cumM.length, 6), y: [0, Math.max(...cumM, ...cumB) * 1.05],
+    series: [{ name: "MDLM", color: "--c2", ys: cumM }, { name: "BD3LM", color: "--c1", ys: cumB }], markers: [{ x: f.g, y: cumM[f.g], color: "--c2" }, { x: f.g, y: cumB[f.g], color: "--c1" }] });
+}
+const st = stepper($c("stp"), show, 600);
+["P", "N", "bs", "steps"].forEach((id) => bindRange(id, build));
+build();
+</script>
+</main></body></html>

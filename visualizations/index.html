@@ -21,6 +21,10 @@
   <a class="card" href="mdlm.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">MDLM sampler →</h3>Every decode step in 6 phases: forward, slice, predict, confidence, top-k, commit.</a>
   <a class="card" href="bd3lm.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">BD3LM sampler →</h3>Prefill, denoise with the cache, rollback, extend — plus the attention-mask explorer.</a>
   <a class="card" href="training.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">Training →</h3>Play the noising schedule and see which tokens the loss is computed on, for MDLM and for BD3LM's noisy-plus-clean blocks.</a>
+  <a class="card" href="options.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">Decoding options →</h3>cfg_scale, right_shift_logits, suppress tokens and remasking, each with the real lines beside it.</a>
+  <a class="card" href="reveal_order.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">Reveal order →</h3>Average commit step per position over many runs: blocks, schedulers and remasking compared.</a>
+  <a class="card" href="compare.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">MDLM vs BD3LM →</h3>The same prompt decoded by both: what the model reads at every step, and the running cost.</a>
+  <a class="card" href="tensors.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">Tensor sizes →</h3>Every tensor a decoding step allocates, from the sliders you set, linked to the code that creates it.</a>
 </div>
 <p style="color:var(--muted);font-size:13px;margin-top:18px">Keys: ← / → step through frames.</p>
 </main></body></html>

@@ -4,7 +4,7 @@ PORT ?= 8000
 OPEN := $(shell if [ "$$(uname)" = Darwin ]; then echo open; else command -v xdg-open 2>/dev/null; fi)
 URL := http://$(HOST):$(PORT)
 
-.PHONY: visualize-samplers visualizer-scheduler visualize-blog visualize-training
+.PHONY: visualize-samplers visualizer-scheduler visualize-blog visualize-training visualize-more
 
 # $(1) = pages to list/open. Serves visualizations/ over HTTP (Ctrl-C to stop),
 # and opens the first page in a browser when an opener exists.
@@ -30,3 +30,7 @@ visualize-blog:
 # What the model is trained on: noising schedule and loss tokens (MDLM, BD3LM)
 visualize-training:
 	$(call serve_pages,training.html)
+
+# Decoding options, reveal order, MDLM vs BD3LM, tensor sizes
+visualize-more:
+	$(call serve_pages,options.html reveal_order.html compare.html tensors.html)

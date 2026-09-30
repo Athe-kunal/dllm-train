@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tensor sizes — what a decoding step allocates</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("tensors.html"))</script>
+
+<h1>Tensor sizes</h1>
+<p class="sub">What one decoding step allocates, for the code as written. Move the sliders; hover a row to see the line that creates the tensor. Model weights and activations inside the transformer are not counted.</p>
+
+<div class="tabs"><button id="tab_mdlm" class="on">MDLM</button><button id="tab_bd3lm">BD3LM</button></div>
+
+<div class="panel">
+  <div class="controls">
+    <label>batch B <input type="range" id="B" min="1" max="64" value="8"><output id="B_o"></output></label>
+    <label>prompt length <input type="range" id="P" min="16" max="4096" step="16" value="256"><output id="P_o"></output></label>
+    <label>max_new_tokens <input type="range" id="N" min="16" max="4096" step="16" value="256"><output id="N_o"></output></label>
+    <label>block_size <input type="range" id="bs" min="1" max="512" value="32"><output id="bs_o"></output></label>
+    <label>vocab V <select id="V"><option value="32000">32,000</option><option value="126464" selected>126,464 (LLaDA)</option><option value="152064">152,064</option></select></label>
+    <label>logits dtype <select id="dt"><option value="2" selected>bf16 / fp16 (2 B)</option><option value="4">fp32 (4 B)</option></select></label>
+  </div>
+  <div class="controls" style="margin-top:10px">
+    <label><span>temperature &gt; 0 (Gumbel)</span><input type="checkbox" id="temp"></label>
+    <label><span>cfg_scale &gt; 0</span><input type="checkbox" id="cfg"></label>
+    <label><span>right_shift_logits</span><input type="checkbox" id="rs"></label>
+    <label>remasking <select id="rm"><option value="low_confidence">low_confidence</option><option value="random">random</option></select></label>
+  </div>
+  <div class="controls" id="kvctl" style="margin-top:10px" hidden>
+    <label>layers <input type="number" id="ly" value="32" style="width:64px"></label>
+    <label>KV heads <input type="number" id="hd" value="32" style="width:64px"></label>
+    <label>head_dim <input type="number" id="hdim" value="128" style="width:64px"></label>
+  </div>
+</div>
+
+<div class="split" style="margin-top:14px">
+  <div>
+    <div class="cap" id="cap"></div>
+    <div class="panel"><div class="tblwrap"><table id="tbl"></table></div><div id="peak" style="margin-top:12px"></div></div>
+  </div>
+  <div class="sticky"><div id="code"></div></div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+let tab = "mdlm", cp = null;
+const fmtB = (b) => { if (b === 0) return "0"; const u = ["B", "KiB", "MiB", "GiB", "TiB"]; let i = 0, v = b; while (v >= 1024 && i < 4) { v /= 1024; i++; } return v.toFixed(v < 10 ? 2 : 1) + " " + u[i]; };
+
+const CODE_MDLM = `# per decoding step (MDLM)
+@x|x = torch.full((B, T), eos_id)                                  # canvas
+@am|attention_mask = (cols < prompt_lens_t + max_new_tokens).long()
+@xcat|x_ = torch.cat([x, un_x], dim=0)                              # cfg_scale > 0
+@logits|logits = self.model(x_, attention_mask=...).logits              # [B(·2), T, V]
+@win|logits = _window_logits(logits, c0, c1, right_shift_logits)     # [B, W, V]
+@g1|logits = logits.to(torch.float64)                                # in add_gumbel_noise
+@g2|noise = torch.rand_like(logits, dtype=torch.float64)
+@g3|return logits - temperature * torch.log(-torch.log(noise))
+@probs|p = F.softmax(logits, dim=-1)                                 # low_confidence
+@small|x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)      # [B, W]`;
+const CODE_BD = `# BD3LM
+@x|x = torch.cat([x, masks_for_new_block], dim=1)                 # [B, T_total]
+@pattn|prompt_attn, prompt_pos = _prepare_for_sampling(x, ...)        # [B,1,P,P] bool, once
+@attn|attn_block, full_pos = _prepare_for_sampling(x, ..., q_start=T_prefix)   # [B,1,L,T_total] bool
+@kv|cond_past, cond_last = self._extend_cache(...)                   # K,V per layer: [B, heads, T_prefix, head_dim]
+@logits|cond_logits_block = self.model(x_block, ..., past_key_values=...).logits   # [B, L, V]
+@unl|un_logits_block = self.model(x_block, ..., past_key_values=uncond_past).logits
+@mix|logits_block = un_logits_block + (cfg_scale + 1) * (cond_logits_block - un_logits_block)
+@shift|shifted = torch.empty_like(logits_block)                      # right_shift_logits
+@g1|logits = logits.to(torch.float64)                                # in add_gumbel_noise
+@g2|noise = torch.rand_like(logits, dtype=torch.float64)
+@g3|return logits - temperature * torch.log(-torch.log(noise))
+@probs|p = F.softmax(logits, dim=-1)                                 # low_confidence`;
+
+function read() {
+  const g = (id) => +$c(id).value, B = g("B"), P = g("P"), N = g("N"), bs = Math.min(g("bs"), N), V = g("V"), dt = g("dt");
+  return { B, P, N, bs, V, dt, dtName: dt === 2 ? "bf16" : "fp32", cfg: $c("cfg").checked, rs: $c("rs").checked, temp: $c("temp").checked, low: $c("rm").value === "low_confidence", ly: g("ly"), hd: g("hd"), hdim: g("hdim") };
+}
+
+function rowsMdlm(o) {
+  const T = o.P + o.N, W = o.bs, m = o.cfg ? 2 : 1, { B, V, dt } = o, bvw = B * W * V;
+  return { W, T, rows: [
+    { tag: "x", name: "x", shape: `[${B}, ${T}]`, dtype: "int64", bytes: B * T * 8, when: "canvas, updated in place", on: true },
+    { tag: "am", name: "attention_mask", shape: `[${B}, ${T}]`, dtype: "int64", bytes: B * T * 8, when: "built once", on: true },
+    { tag: "xcat", name: "x_ = cat([x, un_x])", shape: `[${2 * B}, ${T}]`, dtype: "int64", bytes: 2 * B * T * 8, when: "cfg_scale > 0", on: o.cfg },
+    { tag: "logits", name: "logits (model output)", shape: `[${m * B}, ${T}, ${V}]`, dtype: o.dtName, bytes: m * B * T * V * dt, when: "every step — the only tensor with T columns", on: true },
+    { tag: "win", name: "logits (window)", shape: `[${B}, ${W}, ${V}]`, dtype: o.dtName, bytes: o.cfg || o.rs ? bvw * dt : 0, when: o.cfg || o.rs ? "a copy (cfg mix / right shift)" : "a view of the slice — no new memory", on: true, view: !(o.cfg || o.rs) },
+    { tag: "g1", name: "logits.to(float64)", shape: `[${B}, ${W}, ${V}]`, dtype: "fp64", bytes: bvw * 8, when: "temperature > 0", on: o.temp, gum: true },
+    { tag: "g2", name: "noise = rand_like", shape: `[${B}, ${W}, ${V}]`, dtype: "fp64", bytes: bvw * 8, when: "temperature > 0", on: o.temp, gum: true },
+    { tag: "g3", name: "logits − T·log(−log noise)", shape: `[${B}, ${W}, ${V}]`, dtype: "fp64", bytes: bvw * 8, when: "temperature > 0 (plus short-lived temporaries)", on: o.temp, gum: true },
+    { tag: "probs", name: "p = softmax(logits)", shape: `[${B}, ${W}, ${V}]`, dtype: o.dtName, bytes: bvw * dt, when: "remasking = low_confidence", on: o.low, prob: true },
+    { tag: "small", name: "x0, x0_p, confidence", shape: `[${B}, ${W}]`, dtype: "int64 / float", bytes: B * W * (8 + dt + dt), when: "always", on: true },
+  ] };
+}
+function rowsBd(o) {
+  const padded = Math.ceil(o.P / o.bs) * o.bs, Tt = padded + o.N, L = o.bs, { B, V, dt } = o, blv = B * L * V, branches = o.cfg ? 2 : 1;
+  const kvAt = (t) => 2 * o.ly * B * o.hd * t * o.hdim * dt * branches;
+  return { W: L, T: Tt, rows: [
+    { tag: "x", name: "x", shape: `[${B}, ≤${Tt}]`, dtype: "int64", bytes: B * Tt * 8, when: "grows one block at a time", on: true },
+    { tag: "pattn", name: "prompt_attn", shape: `[${B}, 1, ${padded}, ${padded}]`, dtype: "bool", bytes: B * padded * padded, when: "built once for the prompt", on: true },
+    { tag: "attn", name: "attn_block", shape: `[${B}, 1, ${L}, ≤${Tt}]`, dtype: "bool", bytes: B * L * Tt, when: "each block (only the block's rows)", on: true },
+    { tag: "kv", name: `KV cache${o.cfg ? " (cond + uncond)" : ""} — last block`, shape: `2 × ${o.ly} layers × [${B}, ${o.hd}, ≤${Tt - L}, ${o.hdim}]`, dtype: o.dtName, bytes: kvAt(Tt - L), when: `grows with the prefix; after the prompt: ${fmtB(kvAt(padded))}`, on: true, kv: true },
+    { tag: "logits", name: "cond_logits_block", shape: `[${B}, ${L}, ${V}]`, dtype: o.dtName, bytes: blv * dt, when: "every step — block only", on: true },
+    { tag: "unl", name: "un_logits_block", shape: `[${B}, ${L}, ${V}]`, dtype: o.dtName, bytes: blv * dt, when: "cfg_scale > 0", on: o.cfg },
+    { tag: "mix", name: "mixed logits", shape: `[${B}, ${L}, ${V}]`, dtype: o.dtName, bytes: blv * dt, when: "cfg_scale > 0", on: o.cfg },
+    { tag: "shift", name: "shifted logits", shape: `[${B}, ${L}, ${V}]`, dtype: o.dtName, bytes: blv * dt, when: "right_shift_logits", on: o.rs },
+    { tag: "g1", name: "logits.to(float64)", shape: `[${B}, ${L}, ${V}]`, dtype: "fp64", bytes: blv * 8, when: "temperature > 0", on: o.temp, gum: true },
+    { tag: "g2", name: "noise = rand_like", shape: `[${B}, ${L}, ${V}]`, dtype: "fp64", bytes: blv * 8, when: "temperature > 0", on: o.temp, gum: true },
+    { tag: "g3", name: "logits − T·log(−log noise)", shape: `[${B}, ${L}, ${V}]`, dtype: "fp64", bytes: blv * 8, when: "temperature > 0 (plus short-lived temporaries)", on: o.temp, gum: true },
+    { tag: "probs", name: "p = softmax(logits)", shape: `[${B}, ${L}, ${V}]`, dtype: o.dtName, bytes: blv * dt, when: "remasking = low_confidence", on: o.low, prob: true },
+  ] };
+}
+
+function render() {
+  const o = read(), R = tab === "mdlm" ? rowsMdlm(o) : rowsBd(o), rows = R.rows;
+  $c("kvctl").hidden = tab !== "bd3lm";
+  const on = rows.filter((r) => r.on), mx = Math.max(...on.map((r) => r.bytes), 1);
+  $c("tbl").innerHTML = `<tr><th>tensor</th><th>shape · dtype</th><th>size</th><th style="min-width:90px"></th></tr>` + rows.map((r) => `<tr data-tag="${r.tag}" style="${r.on ? "" : "opacity:.35"}"><td><code>${_esc(r.name)}</code><div style="font-size:11.5px;color:var(--ink2);margin-top:2px">${_esc(r.when)}</div></td><td class="mono" style="font-size:11.5px">${_esc(r.shape)}<br><span style="color:var(--muted)">${r.dtype}</span></td><td class="mono" style="white-space:nowrap"><b>${r.on ? (r.view ? "view" : fmtB(r.bytes)) : "—"}</b></td><td><div class="bar1" style="height:10px"><i style="width:${r.on ? Math.max(0.6, (100 * r.bytes) / mx) : 0}%;background:${r.kv ? "var(--c4)" : r.gum ? "var(--c2)" : "var(--c1)"}"></i></div></td></tr>`).join("");
+  // peak estimate: model output logits stay alive; post-processing adds the window copies + max(Gumbel, softmax)
+  const by = (t) => rows.find((r) => r.tag === t), sum = (a) => a.filter((r) => r.on).reduce((s, r) => s + r.bytes, 0);
+  const gum = sum(rows.filter((r) => r.gum)), prob = sum(rows.filter((r) => r.prob));
+  let base, extra, label;
+  if (tab === "mdlm") { base = by("logits").bytes; extra = by("win").bytes + Math.max(gum, prob); label = "logits [B,T,V] + post-processing"; }
+  else { base = sum([by("logits"), by("unl"), by("mix"), by("shift")]); extra = Math.max(gum, prob); label = "block logits + post-processing"; }
+  const stat = (v, l) => `<span class="stat"><b>${v}</b><span>${l}</span></span>`;
+  $c("peak").innerHTML = stat(fmtB(base + extra), `≈ peak per step: ${label}`) + (tab === "bd3lm" ? stat(fmtB(by("kv").bytes), "KV cache at the last block") : "") + stat(tab === "mdlm" ? `${o.bs} of ${R.T}` : `${o.bs}`, tab === "mdlm" ? "columns W kept after the slice (of T)" : "columns per step (the block)");
+  $c("cap").innerHTML = tab === "mdlm"
+    ? `<b>MDLM</b> · the model output is <code>[B, T, V]</code> — every column, every step. Everything after the slice works on <code>W = block_size</code> columns, so the float64 Gumbel tensors and the softmax scale with the block, not with the canvas.`
+    : `<b>BD3LM</b> · only the block goes through the model, so the logits are <code>[B, L, V]</code>; the memory that grows is the KV cache, which scales with the prefix, layers and heads.`;
+  cp.hl([]);
+  $$("#tbl tr[data-tag]").forEach((tr) => tr.addEventListener("mouseenter", () => cp.hl([tr.dataset.tag])));
+}
+function setTab(name) { tab = name; $c("tab_mdlm").classList.toggle("on", name === "mdlm"); $c("tab_bd3lm").classList.toggle("on", name === "bd3lm"); $c("code").innerHTML = ""; cp = codePanel($c("code"), name === "mdlm" ? "mdlm.py · one decoding step" : "bd3lm.py · one block", name === "mdlm" ? CODE_MDLM : CODE_BD); render(); }
+$c("tab_mdlm").onclick = () => setTab("mdlm"); $c("tab_bd3lm").onclick = () => setTab("bd3lm");
+["B", "P", "N", "bs"].forEach((id) => bindRange(id, render));
+["V", "dt", "temp", "cfg", "rs", "rm", "ly", "hd", "hdim"].forEach((id) => $c(id).addEventListener("input", render));
+setTab(EMBED === "bd3lm" ? "bd3lm" : "mdlm");
+</script>
+</main></body></html>
