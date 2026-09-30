@@ -169,7 +169,7 @@ function simulate(cfg) {
   const rnd = mulberry32(3), S = ALPHA[cfg.sched];
   const { st, B, T, nb } = initCanvas(cfg, rnd), cs = st.map(() => new Array(T).fill(-1));
   const spb = Math.ceil(cfg.steps / nb), snap = (x) => ({ st: st.map((r) => r.slice()), cs: cs.map((r) => r.slice()), ...ctr, ...x });
-  let g = 0; const ctr = { cModel: 0, cNow: 0, cOld: 0 };
+  let g = 0; const ctr = { cModel: 0, cNow: 0 };
   const out = [snap({ phase: "init", b: -1 })];
   for (let b = 0; b < nb; b++) {
     const w = blockWindow(cfg, st, T, b), nt = numTransfer(w.cnt, spb, S, false, rnd);
@@ -190,7 +190,7 @@ function simulate(cfg) {
       const base = { ...ctx, i, conf, x0, sel, top, k, kmax };
       for (const ph of ["fwd", "slice", "pred", "conf", "topk"]) {
         if (ph === "fwd") ctr.cModel += B * T;
-        if (ph === "slice") { ctr.cNow += B * (w.c1 - w.c0); ctr.cOld += B * T; }
+        if (ph === "slice") ctr.cNow += B * (w.c1 - w.c0);
         out.push(snap({ phase: ph, ...base }));
       }
       for (let j = 0; j < B; j++) for (const p of sel[j]) { st[j][p] = 3; cs[j][p] = g; }
@@ -257,9 +257,8 @@ function showDec(i) {
   $c("extra").innerHTML = ex;
 
   $c("counters").innerHTML =
-    `<span class="stat"><b>${f.cModel.toLocaleString()}</b><span>tokens through the model (B×T every step — can't be cached)</span></span>` +
-    `<span class="stat"><b>${f.cNow.toLocaleString()}</b><span>columns through Gumbel / softmax / argmax (now)</span></span>` +
-    `<span class="stat"><b style="color:var(--bad)">${f.cOld.toLocaleString()}</b><span>before: all T columns</span></span>`;
+    `<span class="stat"><b>${f.cModel.toLocaleString()}</b><span>tokens through the model so far (B×T every step — can't be cached)</span></span>` +
+    `<span class="stat"><b>${f.cNow.toLocaleString()}</b><span>columns through Gumbel / softmax / argmax so far (only the window)</span></span>`;
 
   cpMain.hl({ init: [], block: ["blk"], fwd: ["fwd"], slice: ["slice"], pred: ["pred"], conf: ["conf"], topk: ["topk"], commit: ["commit"] }[ph]);
   cpHelp.hl(ph === "slice" ? ["slice"] : ph === "topk" ? ["topk"] : []);

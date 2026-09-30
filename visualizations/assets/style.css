@@ -183,3 +183,20 @@ h1 { margin-bottom: 2px; }
 .embed .sticky { position: static; }
 .embed .code { max-height: none; }
 [hidden] { display: none !important; }
+
+/* ---- training page: word-level token columns ---- */
+.trk { display: flex; flex-wrap: wrap; gap: 12px 6px; }
+.tcol { display: flex; flex-direction: column; gap: 3px; align-items: stretch; min-width: 40px; }
+.wt { font: 12px ui-monospace, "SF Mono", Menlo, monospace; padding: 4px 7px; border-radius: 5px; text-align: center; white-space: nowrap; }
+.wt.clean { background: var(--pad); color: var(--muted); }
+.wt.ctx { background: var(--prompt); color: var(--prompt-ink); }
+.wt.msk { border: 1px dashed var(--c2); background: repeating-linear-gradient(45deg, transparent 0 4px, var(--hatch) 4px 5px); color: var(--c2); }
+.wt.att { outline: 2px solid var(--c4); background: color-mix(in srgb, var(--c4) 22%, var(--surface)); color: var(--ink); }
+.wt.mark { font-size: 10.5px; padding: 0 2px; color: var(--muted); }
+.wt.mark.on { color: var(--c2); font-weight: 600; }
+.blks { display: flex; flex-wrap: wrap; gap: 10px; }
+.blk { border: 1.5px solid var(--line2); border-radius: 10px; padding: 6px 8px 8px; cursor: pointer; transition: opacity .12s; }
+.blk .bh { font: 11px ui-monospace, monospace; color: var(--ink2); margin-bottom: 6px; }
+.blk.sel { border-color: var(--c2); box-shadow: 0 0 0 1px var(--c2) inset; }
+.blk.future { opacity: .38; }
+.rowlab { font: 11px ui-monospace, monospace; color: var(--muted); margin: 0 0 4px; }

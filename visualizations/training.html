@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Training — masked diffusion and block diffusion</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("training.html"))</script>
+
+<h1>Training</h1>
+<p class="sub">What the model is trained on. Each frame is one noise level <i>t</i>: play it forward to watch text get noised, or in reverse for the order sampling visits. Step with ← →</p>
+
+<div class="tabs"><button id="tab_mdlm" class="on">MDLM</button><button id="tab_bd3lm">BD3LM</button></div>
+
+<div class="panel">
+  <div class="controls">
+    <label>text (space-separated tokens) <input type="text" id="text" value="Masked diffusion models learn to recover hidden words from the words that remain visible around them" style="width:340px"></label>
+    <label>scheduler <select id="sched"><option value="linear">Linear</option><option value="cosine">Cosine</option></select></label>
+    <label>direction <select id="dir"><option value="noise">noise  (t: 0 → 1)</option><option value="denoise">denoise  (t: 1 → 0)</option></select></label>
+    <button id="re">resample</button>
+  </div>
+  <div class="controls" id="ctl_bd3lm" style="margin-top:10px" hidden>
+    <label>block_size <input type="range" id="bs" min="2" max="8" value="4"><output id="bs_o"></output></label>
+    <label>inspect block <input type="range" id="insp" min="0" max="7" value="2"><output id="insp_o"></output></label>
+    <label><span>independent t per block</span><input type="checkbox" id="perblock"></label>
+  </div>
+  <div id="stp" style="margin-top:12px"></div>
+</div>
+
+<div class="split" style="margin-top:14px">
+  <div>
+    <div class="cap" id="cap"></div>
+    <div class="panel">
+      <div id="viz"></div>
+      <div id="stats" style="margin-top:12px"></div>
+      <div class="legend" id="legend" style="margin-top:8px"></div>
+    </div>
+  </div>
+  <div>
+    <div class="panel"><div class="mini">masking probability 1 − α(t) — the dot is the current <i>t</i></div><div id="ch_a"></div></div>
+    <div class="panel" style="margin-top:12px"><div class="mini">loss weight w(t) = −α′(t) / (1 − α(t))  (clipped at 12)</div><div id="ch_w"></div></div>
+  </div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+const N = 20;                                   // frames: t = 0, 1/N, …, 1
+let tab = "mdlm", tokens = [], u = [], ub = [], seed = 5, frames = [];
+
+function build() {
+  tokens = $c("text").value.trim().split(/\s+/).filter(Boolean).slice(0, 32);
+  if (!tokens.length) tokens = ["hello"];
+  const rnd = mulberry32(seed);
+  u = tokens.map(() => rnd());                  // one fixed draw per token: masked when u < 1 − α(t)
+  ub = Array.from({ length: 32 }, () => rnd()); // per-block phase for independent noise levels
+  const nb = Math.ceil(tokens.length / +$c("bs").value); $c("insp").max = Math.max(0, nb - 1);
+  frames = Array.from({ length: N + 1 }, (_, i) => (i / N));
+  if ($c("dir").value === "denoise") frames.reverse();
+  st.setN(frames.length, true);
+}
+const wtxt = (S, t) => (t < 0.02 ? "→ ∞" : alphaWeight(S, t).toFixed(2));
+const stat = (v, l) => `<span class="stat"><b>${v}</b><span>${l}</span></span>`;
+
+function show(i) {
+  const t = frames[i], S = ALPHA[$c("sched").value], L = tokens.length;
+  let viz = "", cap = "", stats = "", markers = [], wmarkers = [], legend = "";
+
+  if (tab === "mdlm") {
+    const p = 1 - S.a(t), masked = u.map((v) => v < p), k = masked.filter(Boolean).length;
+    viz = `<div class="trk">` + tokens.map((w, j) => `<div class="tcol"><div class="wt clean">${w}</div><div class="wt ${masked[j] ? "msk" : "ctx"}">${masked[j] ? "[MASK]" : w}</div><div class="wt mark ${masked[j] ? "on" : ""}">${masked[j] ? "CE" : "·"}</div></div>`).join("") + `</div>`;
+    cap = k === 0 ? `<b>t = ${t.toFixed(2)}</b> · nothing is masked yet, so there is nothing to predict and no loss at this noise level.`
+      : `<b>t = ${t.toFixed(2)}</b> · every token is masked with probability 1 − α(t) = <b>${p.toFixed(2)}</b>, giving <b>${k}</b> of ${L} masked tokens. The model reads the middle row and is trained to predict the original word (top row) at those positions <b>only</b>; the loss is <code>w(t) · Σ CE</code>.`;
+    stats = stat(t.toFixed(2), "noise level t") + stat(p.toFixed(2), "P(token masked) = 1 − α(t)") + stat(`${k} / ${L}`, "tokens in the loss") + stat(wtxt(S, t), "weight w(t) on that loss");
+    legend = `<span>top: original word x₀</span><span><i class="sw" style="background:var(--prompt)"></i>middle: model input x_t (visible)</span><span><i class="sw" style="border:1px dashed var(--c2)"></i>middle: [MASK]</span><span style="color:var(--c2)">bottom: CE = cross-entropy is computed here</span><span>each token keeps a fixed random draw <em>u</em>; it is masked when <em>u</em> &lt; 1 − α(t), so the masked set only grows with t</span>`;
+    markers = [{ x: t, y: p, color: "--c2" }]; wmarkers = [{ x: Math.max(0.02, t), y: Math.min(12, t < 0.02 ? 12 : alphaWeight(S, t)), color: "--c2" }];
+  } else {
+    const bs = +$c("bs").value, nb = Math.ceil(L / bs), per = $c("perblock").checked, insp = Math.min(+$c("insp").value, nb - 1);
+    const tb = (b) => (per ? (t + ub[b]) % 1 : t);
+    let inLoss = 0, blocks = "";
+    for (let b = 0; b < nb; b++) {
+      const tt = tb(b), p = 1 - S.a(tt), cols = [];
+      for (let j = b * bs; j < Math.min(L, (b + 1) * bs); j++) {
+        const m = u[j] < p; if (m) inLoss++;
+        const cleanCls = b < insp ? "wt att" : "wt clean";
+        cols.push(`<div class="tcol"><div class="wt ${m ? "msk" : "ctx"}">${m ? "[MASK]" : tokens[j]}</div><div class="${cleanCls}">${tokens[j]}</div><div class="wt mark ${m ? "on" : ""}">${m ? "CE" : "·"}</div></div>`);
+      }
+      markers.push({ x: tt, y: p, color: b === insp ? "--c2" : "--c1" });
+      wmarkers.push({ x: Math.max(0.02, tt), y: Math.min(12, tt < 0.02 ? 12 : alphaWeight(S, tt)), color: b === insp ? "--c2" : "--c1" });
+      blocks += `<div class="blk ${b === insp ? "sel" : ""} ${b > insp ? "future" : ""}" data-b="${b}"><div class="bh">block ${b}${per ? ` · t=${tt.toFixed(2)}` : ""}</div><div class="trk" style="gap:6px">${cols.join("")}</div></div>`;
+    }
+    viz = `<div class="blks">${blocks}</div>`;
+    const ctx = insp === 0 ? "no earlier blocks: block 0 sees only its own noisy tokens" : `blocks 0…${insp - 1} as <b>clean</b> tokens (purple)`;
+    cap = `<b>${per ? "t per block" : "t = " + t.toFixed(2)}</b> · the text is cut into ${nb} blocks of ${bs} and each block is noised on its own. For block <b>${insp}</b> (click a block to change it) the model sees its own noisy tokens plus ${ctx}, and never later blocks (faded). Loss: the <b>${inLoss}</b> masked tokens across <i>all</i> blocks, in one forward pass.`;
+    stats = stat(per ? "per block" : t.toFixed(2), "noise level t") + stat(`${inLoss} / ${L}`, "tokens in the loss") + stat(nb, "blocks") + stat(per ? "Σ over blocks" : wtxt(S, t), "weight w(t) on the loss");
+    legend = `<span><i class="sw" style="background:var(--prompt)"></i>top: noisy block x_t (bidirectional inside the block)</span><span><i class="sw" style="border:1px dashed var(--c2)"></i>[MASK]</span><span><i class="sw" style="background:color-mix(in srgb,var(--c4) 30%,var(--surface))"></i>middle: clean tokens of earlier blocks = context</span><span style="color:var(--c2)">bottom: CE = cross-entropy is computed here</span>`;
+  }
+  $c("viz").innerHTML = viz; $c("cap").innerHTML = cap; $c("stats").innerHTML = stats; $c("legend").innerHTML = legend;
+  lineChart($c("ch_a"), { x: [0, 1], xname: "t", xlabel: "t", ylabel: "1 − α(t)", y: [0, 1], series: [{ name: "P(masked)", color: "--c1", f: (x) => 1 - S.a(x) }], markers });
+  lineChart($c("ch_w"), { x: [0.02, 1], xname: "t", xlabel: "t", ylabel: "w(t)", y: [0, 12], series: [{ name: "w(t)", color: "--c3", f: (x) => Math.min(12, alphaWeight(S, x)) }], markers: wmarkers });
+  $$("#viz .blk").forEach((el) => el.addEventListener("click", () => { $c("insp").value = el.dataset.b; $c("insp_o").textContent = el.dataset.b; show(i); }));
+}
+
+const st = stepper($c("stp"), show, 500);
+function setTab(name) {
+  tab = name; $c("tab_mdlm").classList.toggle("on", name === "mdlm"); $c("tab_bd3lm").classList.toggle("on", name === "bd3lm");
+  $c("ctl_bd3lm").hidden = name !== "bd3lm"; build();
+}
+$c("tab_mdlm").onclick = () => setTab("mdlm"); $c("tab_bd3lm").onclick = () => setTab("bd3lm");
+["text", "sched", "dir", "perblock"].forEach((id) => $c(id).addEventListener("input", build));
+bindRange("bs", build); bindRange("insp", () => st.setN(frames.length, true));
+$c("re").onclick = () => { seed++; build(); };
+setTab(EMBED === "bd3lm" ? "bd3lm" : "mdlm");
+</script>
+</main></body></html>

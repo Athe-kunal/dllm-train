@@ -94,14 +94,12 @@
 
 <p>Block diffusion changes the model, not just the sampler. It is trained with a block-causal attention mask: a token sees its own block and all earlier blocks, never later ones. Two things follow. The canvas can grow one block at a time and stop early on EOS. And a finished block's keys and values can never change again, so they can live in a KV cache, which is exactly what MDLM cannot have.</p>
 
-<p>The sampler manages that cache with three operations: <b>prefill</b> the prompt once, <b>roll back</b> after every denoising step, and <b>extend</b> once per finished block. The rollback is the subtle one. Hugging Face style caches are updated in place by any forward pass, even one called with <code>use_cache=False</code>, so a denoising step would otherwise leave its tentative block keys and values behind. The simple fix is to deep-copy the whole cache before every step; cropping it back afterwards does the same job without the copy.</p>
+<p>The sampler manages that cache with three operations: <b>prefill</b> the prompt once, <b>roll back</b> after every denoising step, and <b>extend</b> once per finished block. The rollback is the subtle one. Hugging Face style caches are updated in place by any forward pass, even one called with <code>use_cache=False</code>, so a denoising step would otherwise leave its tentative block keys and values behind. One way to protect the cache is to deep-copy it before every step; the sampler instead crops it back afterwards, which does the same job without the copy.</p>
 
 <figure>
   <iframe data-embed="bd3lm.html?embed=1" title="BD3LM sampler" height="320" loading="lazy"></iframe>
   <figcaption>The strip under the canvas is the KV cache: watch it gain a temporary block during the forward and lose it on the rollback. The second tab is the block-causal mask. <a href="bd3lm.html">Open full page</a></figcaption>
 </figure>
-
-<p>The counters compare against the straightforward implementation, which re-encodes the entire prefix at the start of every block and deep-copies the cache at every step. Re-encoding makes total prefill work grow quadratically with the number of blocks instead of linearly; the copies multiply memory traffic by the prefix length.</p>
 
 <h3 id="compare">The two side by side</h3>
 

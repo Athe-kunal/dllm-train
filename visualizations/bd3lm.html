@@ -126,19 +126,18 @@ function simB(cfg) {
   const nb = Math.ceil(cfg.maxNew / bs), spb = Math.ceil(cfg.steps / nb);
   const st = cfg.pls.map((L) => Array.from({ length: padded }, (_, p) => (p < padded - L ? 4 : 0)));
   const cs = cfg.pls.map(() => new Array(Tfin).fill(-1)), eosCell = cfg.pls.map(() => new Set());
-  let done = new Array(B).fill(false), gen = 0, g = 0, cnow = B * padded * mult, cold = B * padded * mult, cpNow = 0, cpOld = 0, cache = padded;
-  const snap = (x) => ({ st: st.map((r) => r.slice()), cs: cs.map((r) => r.slice()), eosCell: eosCell.map((s) => new Set(s)), len: st[0].length, cnow, cold, cpNow, cpOld, cache, ...x });
+  let done = new Array(B).fill(false), gen = 0, g = 0, cnow = B * padded * mult, cpNow = 0, cache = padded;
+  const snap = (x) => ({ st: st.map((r) => r.slice()), cs: cs.map((r) => r.slice()), eosCell: eosCell.map((s) => new Set(s)), len: st[0].length, cnow, cpNow, cache, ...x });
   const out = [snap({ phase: "prefill", tmp: 0, note: `${B}×${padded} tokens` })];
   for (let b = 0; b < nb; b++) {
     if (done.every(Boolean)) break;
     const P = st[0].length, cl = Math.min(bs, cfg.maxNew - gen); if (cl <= 0) break;
-    if (b > 0) cold += B * P * mult;
     for (let j = 0; j < B; j++) for (let i = 0; i < cl; i++) st[j].push(1);
     const nt = numTransfer(new Array(B).fill(cl), spb, S, false, rnd);
     const ctx = { b, nb, lo: P, hi: P + cl, P, cl, eff: nt.maxLen };
     out.push(snap({ phase: "append", tmp: 0, ...ctx }));
     for (let i = 0; i < nt.maxLen; i++) {
-      cnow += B * cl * mult; cold += B * cl * mult; cpNow += B * P * mult; cpOld += 2 * B * P * mult;
+      cnow += B * cl * mult; cpNow += B * P * mult;
       const conf = [], sel = [];
       for (let j = 0; j < B; j++) {
         const c = new Array(Tfin).fill(-Infinity);
@@ -169,7 +168,7 @@ const CAPB = {
   prefill: (f) => `<b>prefill</b> · the prompt is encoded <i>once</i>; the KV cache now holds <b>${f.cache}</b> tokens per row.`,
   append: (f) => `<b>block ${f.b + 1}/${f.nb}</b> · append ${f.cl} masks. No model call yet; the cache still holds ${f.P} tokens.`,
   fwd: (f) => `<b>forward</b> · only the ${f.cl} block tokens go through the model, attending to the ${f.P}-token cache. The forward also appends their K/V to the cache <i>temporarily</i>.`,
-  rollback: (f) => `<b>rollback</b> · a denoising step must not change the cache: <code>crop</code> it back to ${f.P} tokens (before: a deepcopy every step).`,
+  rollback: (f) => `<b>rollback</b> · a denoising step must not change the cache: <code>crop</code> it back to ${f.P} tokens so the next step starts from the same prefix.`,
   select: (f) => `<b>select</b> · top-k per row → commit (k = [${f.k.join(", ")}]). Step ${f.i + 1}/${f.eff}.`,
   extend: (f) => `<b>extend</b> · the finished block runs through the model <i>once</i> and joins the cache (${f.P} → ${f.P + f.cl}). Its K/V never change again, because later blocks can't affect it.`,
   done: (f) => `<b>done</b> · last block (or all rows hit EOS) — no extension needed.`,
@@ -199,8 +198,8 @@ function showB(i) {
   $c("seqs").innerHTML = h + cb + "</div></div>";
   $c("cap").innerHTML = CAPB[ph](f);
   $c("counters").innerHTML =
-    `<span class="stat"><b>${f.cnow.toLocaleString()}</b><span>tokens through the model (now)</span></span><span class="stat"><b style="color:var(--bad)">${f.cold.toLocaleString()}</b><span>before: prefix re-encoded every block</span></span>` +
-    `<span class="stat"><b>${f.cpNow.toLocaleString()}</b><span>KV tokens copied (now)</span></span><span class="stat"><b style="color:var(--bad)">${f.cpOld.toLocaleString()}</b><span>before: deepcopy + concat per step</span></span>`;
+    `<span class="stat"><b>${f.cnow.toLocaleString()}</b><span>tokens through the model so far</span></span>` +
+    `<span class="stat"><b>${f.cpNow.toLocaleString()}</b><span>KV tokens concatenated by the model so far (one prefix per step)</span></span>`;
   cpMain.hl([ph]); cpHelp.hl([ph]);
   const w = { prefill: [["x", `[${B}, ${M.padded}]`, "left-padded prompts"], ["cond_past", `${f.cache} tokens`]],
     append: [["T_prefix", f.P], ["T_total", f.P + (f.cl || 0)], ["attn_block", `[${B}, 1, ${f.cl}, ${f.P + (f.cl || 0)}]`, "block rows only"]],

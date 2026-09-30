@@ -207,7 +207,7 @@ function bindRange(id, cb) {
 }
 function navHtml(active) {
   if (EMBED !== null) return "";
-  const items = [["index.html", "Overview"], ["schedulers.html", "Schedulers"], ["utils.html", "samplers/utils"], ["mdlm.html", "MDLM sampler"], ["bd3lm.html", "BD3LM sampler"]];
+  const items = [["index.html", "Overview"], ["schedulers.html", "Schedulers"], ["utils.html", "samplers/utils"], ["mdlm.html", "MDLM sampler"], ["bd3lm.html", "BD3LM sampler"], ["training.html", "Training"]];
   return `<nav class="top">${items.map(([h, t]) => `<a href="${h}" class="${h === active ? "on" : ""}">${t}</a>`).join("")}</nav>`;
 }
 

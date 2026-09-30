@@ -8,7 +8,7 @@ description: How to write an interactive, line-by-line visualization of a Python
 The output is one self-contained HTML page in `visualizations/`, built from the shared
 `assets/common.js` + `assets/style.css`. No build step, no CDN, no external requests.
 Good examples to copy from: `utils.html` (tabs, one function each), `mdlm.html`
-(phases per step + an explorer tab), `bd3lm.html` (state strip + before/now counters),
+(phases per step + an explorer tab), `bd3lm.html` (state strip + cost counters),
 `schedulers.html` (sliders instead of a stepper).
 
 ## The style (this is what the user likes — keep to it)
@@ -25,7 +25,7 @@ Good examples to copy from: `utils.html` (tabs, one function each), `mdlm.html`
 - **Interactive inputs on top** (sliders, a text box, a checkbox) that rebuild the frames. Several
   functions in one file → one tab per function. A concept that needs exploring rather than
   stepping (a mask, a window) → its own tab with hover.
-- When the code is about cost, show **before / now counters** (tokens through the model, bytes copied).
+- When the code is about cost, show **live counters of what the code does as written** (tokens through the model, KV tokens concatenated). Describe the code as it is: **no before/after comparisons with older versions of the code** unless explicitly asked.
 - The code shown must be the **real, current code**, condensed. Re-read the file first: it may have
   been refactored since you last saw it, and stale names in a snippet are a bug.
 
@@ -61,7 +61,7 @@ Good examples to copy from: `utils.html` (tabs, one function each), `mdlm.html`
 | `navHtml(active)`, `EMBED` | Nav bar; `EMBED` is the `?embed=` value (`null` when not embedded). |
 
 Layout classes (`assets/style.css`): `.panel`, `.split` (viz left, code right; stays two columns
-inside embeds), `.sticky`, `.cap`, `.controls`, `.tabs`, `.legend`, `.stat` (big before/now numbers),
+inside embeds), `.sticky`, `.cap`, `.controls`, `.tabs`, `.legend`, `.stat` (big counter numbers),
 `.numgrid/.ncell` (small integer matrices), and the token grid: `.seq > .row > .cell` with states
 `prompt mask done eos pad kv tmp sel dim proc`, `.row.bars` for confidence bars, `.row.win` for a
 window bracket. Colours are CSS variables (`--c1..--c4`, `--bad`, …) and adapt to dark mode.
