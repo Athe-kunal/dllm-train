@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Schedulers — dllm/core/schedulers</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("schedulers.html"))</script>
+
+<h1>Schedulers</h1>
+<p class="sub">α(t) = chance a token is still <i>unmasked</i> at diffusion time t (0 = clean text, 1 = all masks). Sampling walks t from 1 down to 0. Drag the sliders.</p>
+
+<section id="sec_alpha">
+<h2 style="margin-top:20px">Alpha</h2>
+<div class="panel">
+  <div class="controls">
+    <label>scheduler <select id="al"><option value="linear">Linear</option><option value="cosine">Cosine</option></select></label>
+    <label>t <input type="range" id="t" min="0.02" max="1" step="0.01" value="0.75"><output id="t_o"></output></label>
+    <label>s (&lt; t) <input type="range" id="s" min="0" max="0.98" step="0.01" value="0.5"><output id="s_o"></output></label>
+    <label>steps <input type="range" id="n" min="1" max="32" value="8"><output id="n_o"></output></label>
+  </div>
+</div>
+<div class="split" style="margin-top:14px">
+  <div>
+    <div class="panel"><div class="mini">α(t) · dashed = the other scheduler</div><div id="ch_a"></div></div>
+    <div class="panel" style="margin-top:12px"><div class="mini">p_reveal per step = 1 − reverse_mask_prob(s, t) — the numbers <code>get_num_transfer_tokens</code> uses</div><div id="ch_p"></div></div>
+  </div>
+  <div class="sticky"><div id="code_a"></div><div id="watch_a"></div></div>
+</div>
+
+</section>
+<section id="sec_kappa">
+<h2>Kappa <span style="font-weight:400;color:var(--muted);font-size:14px">· not used by the samplers</span></h2>
+<div class="panel">
+  <div class="controls">
+    <label>a <input type="range" id="ka" min="-3" max="4" step="0.1" value="1"><output id="ka_o"></output></label>
+    <label>b <input type="range" id="kb" min="-3" max="4" step="0.1" value="1"><output id="kb_o"></output></label>
+    <label>t <input type="range" id="kt" min="0" max="1" step="0.01" value="0.5"><output id="kt_o"></output></label>
+  </div>
+</div>
+<div class="split" style="margin-top:14px">
+  <div><div class="panel"><div class="mini">κ(t): Cubic(a,b) · Linear (a=−1, b=0) · Cosine</div><div id="ch_k"></div></div></div>
+  <div class="sticky"><div id="code_k"></div><div id="watch_k"></div></div>
+</div>
+
+</section>
+
+<script>
+const $c = (id) => document.getElementById(id);
+if (EMBED === "alpha") $c("sec_kappa").hidden = true;
+const CODE_A = `class BaseAlphaScheduler(BaseScheduler):
+@w|    def weight(self, i):
+@w|        alpha, alpha_derivative = self.value_and_derivative(i)
+@w|        return -alpha_derivative / (1 - alpha + 1e-6)
+@rmp|    def reverse_mask_prob(self, s, t):
+@rmp|        return (1 - self._value(s)) / (1 - self._value(t))   # P(masked at s | masked at t)
+
+class LinearAlphaScheduler(BaseAlphaScheduler):
+@linear|    def _value(self, t):      return 1 - t
+@linear|    def _derivative(self, t): return -torch.ones_like(t)
+
+class CosineAlphaScheduler(BaseAlphaScheduler):
+@cosine|    def _value(self, t):      return 1 - torch.cos((math.pi / 2) * (1 - t))
+@cosine|    def _derivative(self, t): return -(math.pi / 2) * torch.sin((math.pi / 2) * (1 - t))`;
+const CODE_K = `class CubicKappaScheduler(BaseKappaScheduler):
+    a: float = 1.0
+    b: float = 1.0
+@cub|    def _value(self, t):
+@cub|        return (a + 1) * t**3 - (a + b + 1) * t**2 + (b + 1) * t
+@cub|    def _derivative(self, t):
+@cub|        return 3 * (a + 1) * t**2 - 2 * (a + b + 1) * t + (b + 1)
+
+class LinearKappaScheduler(CubicKappaScheduler):
+@lin|    a: float = -1.0                       # κ(t) = t
+@lin|    b: float = 0.0
+
+class CosineKappaScheduler(BaseKappaScheduler):
+@cos|    def _value(self, t): return 1.0 - torch.cos(0.5 * math.pi * t)`;
+const cpA = codePanel($c("code_a"), "schedulers/alpha.py (+ base.py)", CODE_A);
+const cpK = codePanel($c("code_k"), "schedulers/kappa.py", CODE_K);
+const f4 = (v) => (+v).toFixed(4);
+
+function renderA(focus) {
+  const nm = $c("al").value, S = ALPHA[nm], O = ALPHA[nm === "linear" ? "cosine" : "linear"];
+  let t = +$c("t").value, s = +$c("s").value;
+  if (s >= t) { s = Math.max(0, t - 0.01); $c("s").value = s; $c("s_o").textContent = s.toFixed(2); }
+  const n = +$c("n").value, col = nm === "linear" ? "--c1" : "--c2", ocol = nm === "linear" ? "--c2" : "--c1";
+  lineChart($c("ch_a"), { x: [0, 1], xname: "t", xlabel: "t", ylabel: "α(t)", y: [0, 1],
+    series: [{ name: S.name.replace("AlphaScheduler", ""), color: col, f: S.a }, { name: O.name.replace("AlphaScheduler", ""), color: ocol, f: O.a, dash: "6 4" }],
+    markers: [{ x: t, y: S.a(t), color: col }, { x: s, y: S.a(s), color: col }] });
+  const p = (X) => Array.from({ length: n }, (_, j) => 1 - reverseMaskProb32(X, (n - 1 - j) / n, (n - j) / n));
+  lineChart($c("ch_p"), { xs: Array.from({ length: n }, (_, j) => j), xname: "step j", xlabel: "step j", ylabel: "p_reveal", y: [0, 1], fmtX: (v) => Math.round(v), xticks: Math.min(n, 6), dots: n <= 32,
+    series: [{ name: S.name.replace("AlphaScheduler", ""), color: col, ys: p(S) }, { name: O.name.replace("AlphaScheduler", ""), color: ocol, ys: p(O), dash: "6 4" }] });
+  cpA.hl([nm, ...(focus === "s" ? ["rmp"] : focus === "t" ? ["w"] : [])]);
+  watch($c("watch_a"), [["t", f4(t)], ["α(t)", f4(S.a(t)), "1 − α = " + f4(1 - S.a(t))], ["α′(t)", f4(S.d(t))], ["w(t)", f4(alphaWeight(S, t)), "−α′ / (1−α+1e-6)"],
+    ["s", f4(s)], ["α(s)", f4(S.a(s))], ["P(masked)", f4(reverseMaskProb(S, s, t)), "(1−α(s)) / (1−α(t))"], ["p_reveal", f4(1 - reverseMaskProb(S, s, t)), "1 − that"]]);
+}
+$c("al").addEventListener("input", () => renderA());
+bindRange("t", () => renderA("t")); bindRange("s", () => renderA("s")); bindRange("n", () => renderA("n"));
+renderA();
+
+function renderK() {
+  const a = +$c("ka").value, b = +$c("kb").value, t = +$c("kt").value, C = kappaCubic(a, b), L = kappaCubic(-1, 0);
+  lineChart($c("ch_k"), { x: [0, 1], xname: "t", xlabel: "t", ylabel: "κ(t)",
+    series: [{ name: "Cubic", color: "--c1", f: C.k }, { name: "Linear", color: "--c3", f: L.k, dash: "3 3" }, { name: "Cosine", color: "--c2", f: KAPPA_COS.k, dash: "6 4" }],
+    markers: [{ x: t, y: C.k(t), color: "--c1" }] });
+  cpK.hl(["cub"]);
+  watch($c("watch_k"), [["a, b", `${a}, ${b}`], ["t", f4(t)], ["κ(t)", f4(C.k(t)), "cubic"], ["κ′(t)", f4(C.d(t))], ["w(t)", f4(kappaWeight(C, t)), "κ′ / (1−κ+1e-6)"], ["κ(0), κ(1)", `${f4(C.k(0))}, ${f4(C.k(1))}`, "always 0, 1"]]);
+}
+["ka", "kb", "kt"].forEach((id) => bindRange(id, renderK)); renderK();
+</script>
+</main></body></html>

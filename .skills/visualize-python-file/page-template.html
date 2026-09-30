@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NAME — path/to/file.py</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("NAME.html"))</script>
+
+<h1>NAME</h1>
+<p class="sub">One sentence: what this code does. Step through it with ← →</p>
+
+<div class="panel">
+  <div class="controls">
+    <!-- inputs that rebuild the frames -->
+    <label>size <input type="range" id="n" min="2" max="12" value="6"><output id="n_o"></output></label>
+    <label><span>option</span><input type="checkbox" id="opt"></label>
+  </div>
+  <div id="stp" style="margin-top:12px"></div>
+</div>
+
+<div class="split" style="margin-top:14px">
+  <div>
+    <div class="cap" id="cap"></div>
+    <div class="panel"><div class="seqs" id="viz"></div></div>
+  </div>
+  <div class="sticky"><div id="code"></div><div id="watch"></div></div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+
+// 1 · the REAL code, condensed. "@tag|" marks the lines that belong to a frame's phase.
+const CODE = `def my_function(x, n):
+@init|    y = torch.zeros(n)
+@loop|    for i in range(n):
+@loop|        y[i] = x[i] * 2
+@out|    return y`;
+const cp = codePanel($c("code"), "path/to/file.py · my_function", CODE);
+
+// 2 · a JS port of the algorithm that produces every frame up-front (snapshots + what to draw)
+let frames = [];
+function build() {
+  const n = +$c("n").value, x = Array.from({ length: n }, (_, i) => i + 1), y = [];
+  frames = [{ phase: "init", y: [] }];
+  for (let i = 0; i < n; i++) { y.push(x[i] * 2); frames.push({ phase: "loop", i, y: y.slice() }); }
+  frames.push({ phase: "out", y: y.slice() });
+  st.setN(frames.length, true);
+}
+
+// 3 · draw one frame: caption (phase name in bold) + picture + highlighted code + live variables
+const CAP = { init: "<b>init</b> · allocate the output.", loop: (f) => `<b>loop</b> · element ${f.i}.`, out: "<b>return</b> · done." };
+function show(i) {
+  const f = frames[i], cap = CAP[f.phase];
+  $c("cap").innerHTML = typeof cap === "function" ? cap(f) : cap;
+  $c("viz").innerHTML = `<div class="tokrow">${f.y.map((v) => `<div class="cell done" style="--f:.5;width:32px">${v}</div>`).join("")}</div>`;
+  cp.hl([f.phase]);
+  watch($c("watch"), [["y", "[" + f.y.join(", ") + "]", `len ${f.y.length}`]]);
+}
+
+const st = stepper($c("stp"), show, 600);
+bindRange("n", build); $c("opt").addEventListener("input", build);
+build();
+</script>
+</main></body></html>

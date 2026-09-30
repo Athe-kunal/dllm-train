@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>samplers/utils.py — dllm/core/samplers/utils.py</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("utils.html"))</script>
+
+<h1>samplers/utils.py</h1>
+<p class="sub">The three helpers both samplers are built from. Pick a function, then step through it with ← →</p>
+
+<div class="tabs"><button id="tab_counts" class="on">get_num_transfer_tokens</button><button id="tab_topk">topk_transfer_mask</button><button id="tab_gumbel">add_gumbel_noise</button></div>
+
+<div class="panel">
+  <!-- controls: counts -->
+  <div class="controls" id="ctl_counts">
+    <label>masks per row <input type="text" id="counts" value="32,11,5" style="width:110px"></label>
+    <label>steps <input type="range" id="steps" min="1" max="24" value="8"><output id="steps_o"></output></label>
+    <label>scheduler <select id="sched"><option value="linear">Linear</option><option value="cosine">Cosine</option></select></label>
+    <label><span>stochastic</span><input type="checkbox" id="sto"></label>
+  </div>
+  <!-- controls: topk -->
+  <div class="controls" id="ctl_topk" hidden>
+    <label>rows <input type="range" id="tk_B" min="1" max="4" value="3"><output id="tk_B_o"></output></label>
+    <label>columns L <input type="range" id="tk_L" min="6" max="16" value="10"><output id="tk_L_o"></output></label>
+    <label>k per row <input type="text" id="tk_k" value="3,1,2" style="width:80px"></label>
+    <label>% ineligible (−inf) <input type="range" id="tk_inf" min="0" max="80" value="30"><output id="tk_inf_o"></output></label>
+    <button id="tk_re">resample</button>
+  </div>
+  <!-- controls: gumbel -->
+  <div class="controls" id="ctl_gumbel" hidden>
+    <label>logits <input type="text" id="g_logits" value="2.0, 1.0, 0.5, 0.0, -1.0" style="width:170px"></label>
+    <label>temperature <input type="range" id="g_T" min="0" max="3" step="0.1" value="1"><output id="g_T_o"></output></label>
+    <button id="g_re">resample noise</button>
+  </div>
+  <div id="stp" style="margin-top:12px"></div>
+</div>
+
+<div class="split" style="margin-top:14px">
+  <div>
+    <div class="cap" id="cap"></div>
+    <div class="panel"><div class="seqs" id="viz"></div></div>
+  </div>
+  <div class="sticky"><div id="code"></div><div id="watch"></div></div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+const list = (a, k = 3) => "[" + a.map((v) => (v === -Infinity ? "−inf" : typeof v === "number" && !Number.isInteger(v) ? v.toFixed(k) : v)).join(", ") + "]";
+const fmt = (a, k = 4) => "[" + a.slice(0, 8).map((v) => (+v).toFixed(k)).join(", ") + (a.length > 8 ? ", …" : "") + "]";
+const ridx = (n, rnd) => Math.floor(rnd() * n);
+const TOK = "ABCDEFGH";
+
+/* =========================================================
+   1 · get_num_transfer_tokens
+   ========================================================= */
+const CODE_COUNTS = `def get_num_transfer_tokens(mask_index, steps, scheduler, stochastic=False):
+@A|    mask_num = mask_index.sum(dim=1).to("cpu", torch.float64)     # [B]
+    B = mask_num.size(0)
+
+@B|    j = torch.arange(steps, dtype=torch.float64)
+@B|    s = (steps - 1 - j) / steps
+@B|    t = (steps - j) / steps
+@B|    p_all = (1 - scheduler.reverse_mask_prob(s=s, t=t)).to(torch.float64)   # [steps]
+
+@C|    num_transfer_tokens = torch.zeros(B, steps, dtype=torch.int64)
+@C|    for j, p in enumerate(p_all.tolist()):
+@Cd|        n_step = torch.round(mask_num * p)
+@Cs|        n_step = Binomial(mask_num, p).sample()
+@C|        n_step = torch.minimum(n_step, mask_num)
+@C|        num_transfer_tokens[:, j] = n_step.to(torch.int64)
+@C|        mask_num = mask_num - n_step
+
+@D|    nonzero = num_transfer_tokens > 0
+@D|    order = torch.argsort((~nonzero).to(torch.uint8), dim=1, stable=True)
+@D|    packed = torch.gather(num_transfer_tokens, 1, order)
+@D|    max_len = int(nonzero.sum(dim=1).max())
+@D|    return packed[:, :max_len]`;
+
+function ngrid(m, curCol, upTo) {
+  const cols = m[0] ? m[0].length : 0;
+  let h = `<div class="numgrid" style="grid-template-columns:auto repeat(${cols},minmax(24px,1fr))"><div class="ncell hd"></div>` + Array.from({ length: cols }, (_, i) => `<div class="ncell hd">${i}</div>`).join("");
+  m.forEach((r, b) => { h += `<div class="ncell hd">row ${b}</div>` + r.map((v, j) => `<div class="ncell ${upTo !== undefined && j > upTo ? "" : v > 0 ? "nz" : ""} ${j === curCol ? "cur" : ""}">${upTo !== undefined && j > upTo ? "" : v}</div>`).join(""); });
+  return h + "</div>";
+}
+const COUNTS = {
+  code: CODE_COUNTS, title: "dllm/core/samplers/utils.py · get_num_transfer_tokens", ctl: "ctl_counts",
+  build() {
+    this.counts = $c("counts").value.split(",").map((s) => Math.max(0, parseInt(s) || 0)).slice(0, 5);
+    if (!this.counts.length) this.counts = [1];
+    this.steps = +$c("steps").value; const S = ALPHA[$c("sched").value]; this.sto = $c("sto").checked;
+    this.R = numTransfer(this.counts, this.steps, S, this.sto, mulberry32(11));
+    this.frames = [{ k: "A" }, { k: "B" }, ...Array.from({ length: this.steps }, (_, j) => ({ k: "C", j })), { k: "D" }];
+  },
+  show(i) {
+    const f = this.frames[i], { counts, steps, R, sto } = this, mx = Math.max(...counts, 1), stage = f.k;
+    let cap = "", viz = "", w = [];
+    if (stage === "A") {
+      cap = "<b>A</b> · count the masked tokens in each row.";
+      viz = counts.map((c, b) => `<div class="mini">row ${b}: <b>${c}</b> masked</div><div class="bar1"><i style="width:${(100 * c) / mx}%;background:var(--c1)"></i></div>`).join("");
+      w = [["mask_num", list(counts), "[B]"], ["B", counts.length]];
+    } else if (stage === "B") {
+      cap = "<b>B</b> · reveal probability for <i>every</i> step, in one scheduler call (it depends only on <code>j</code>, not on the data).";
+      viz = '<div id="chp"></div>';
+      w = [["j", "0 … " + (steps - 1)], ["t", fmt(R.probs.map((_, j) => (steps - j) / steps), 3)], ["s", fmt(R.probs.map((_, j) => (steps - 1 - j) / steps), 3)], ["p_all", fmt(R.probs), `[${steps}]`]];
+    } else if (stage === "C") {
+      const j = f.j, p = R.probs[j], before = R.remainingBefore[j];
+      cap = `<b>C</b> · step <b>${j}</b>: reveal <code>${sto ? "Binomial(remaining, p)" : "round(remaining × p)"}</code> tokens per row, then <code>remaining −= revealed</code>.`;
+      viz = `<div class="mini">step ${j} of ${steps - 1} · t=${((steps - j) / steps).toFixed(3)} → s=${((steps - 1 - j) / steps).toFixed(3)} · <b>p_reveal = ${p.toFixed(4)}</b></div>` +
+        counts.map((c, b) => {
+          const rev = R.raw[b][j], rem = before[b] - rev, done = c - before[b];
+          return `<div class="mini" style="margin-top:8px">row ${b}: remaining <b>${before[b]}</b> × ${p.toFixed(3)} = ${R.expected[b][j].toFixed(2)} → reveal <b style="color:var(--c2)">${rev}</b></div>` +
+            `<div class="bar1"><i title="revealed earlier" style="width:${(100 * done) / mx}%;background:var(--line2)"></i><i style="width:${(100 * rev) / mx}%;background:var(--c2)"></i><i style="width:${(100 * rem) / mx}%;background:var(--c1)"></i></div>`;
+        }).join("") +
+        `<div class="legend"><span><i class="sw" style="background:var(--line2)"></i>revealed earlier</span><span><i class="sw" style="background:var(--c2)"></i>this step</span><span><i class="sw" style="background:var(--c1)"></i>still masked</span></div>` +
+        `<div class="mini" style="margin-top:10px">num_transfer_tokens so far</div>` + ngrid(R.raw, j, j);
+      w = [["j", j], ["p", p.toFixed(6)], ["mask_num", list(before), "before"], ["n_step", list(counts.map((_, b) => R.raw[b][j]))], ["mask_num", list(counts.map((_, b) => before[b] - R.raw[b][j])), "after"]];
+    } else {
+      cap = "<b>D</b> · steps that reveal nothing waste a model forward: left-pack the non-zeros, trim to the widest row.";
+      const order = R.raw.map((row) => { const nz = [], z = []; row.forEach((v, j) => (v > 0 ? nz : z).push(j)); return nz.concat(z); });
+      viz = `<div class="mini">num_transfer_tokens  [B, steps]</div>` + ngrid(R.raw) + `<div class="mini" style="margin-top:8px">order = argsort(~nonzero, stable)</div>` + ngrid(order).replace(/ nz/g, "") +
+        `<div class="mini" style="margin-top:8px">packed[:, :max_len]  →  returned  (${steps} → <b>${R.maxLen}</b> steps)</div>` + (R.maxLen ? ngrid(R.packed) : "<i>empty</i>");
+      w = [["max_len", R.maxLen, `of ${steps} steps`], ["returned", `[${counts.length}, ${R.maxLen}]`]];
+    }
+    $c("cap").innerHTML = cap; $c("viz").innerHTML = viz; watch($c("watch"), w);
+    cp.hl(stage === "C" ? ["C", sto ? "Cs" : "Cd"] : [stage]);
+    if (stage === "B") lineChart($c("chp"), { xs: R.probs.map((_, j) => j), series: [{ name: "p_reveal", color: "--c1", ys: R.probs }], y: [0, 1], xname: "step j", xlabel: "step j", ylabel: "p_reveal", fmtX: (v) => Math.round(v), xticks: Math.min(steps, 6), dots: steps <= 32 });
+  },
+};
+
+/* =========================================================
+   2 · topk_transfer_mask
+   ========================================================= */
+const CODE_TOPK = `def topk_transfer_mask(confidence, k, k_max):
+@init|    transfer = torch.zeros_like(confidence, dtype=torch.bool)
+@init|    if k_max <= 0:
+@init|        return transfer
+@topk|    vals, idx = torch.topk(confidence, k=min(k_max, confidence.size(1)), dim=1)
+@keep|    keep = torch.arange(vals.size(1), device=k.device)[None, :] < k[:, None]
+@guard|    keep &= vals > -float("inf")
+@scatter|    return transfer.scatter_(1, idx, keep)`;
+const TOPK = {
+  code: CODE_TOPK, title: "dllm/core/samplers/utils.py · topk_transfer_mask", ctl: "ctl_topk", seed: 4,
+  build() {
+    const B = +$c("tk_B").value, L = +$c("tk_L").value, pInf = +$c("tk_inf").value / 100, rnd = mulberry32(this.seed);
+    this.B = B; this.L = L;
+    this.conf = Array.from({ length: B }, () => Array.from({ length: L }, () => (rnd() < pInf ? -Infinity : Math.round(rnd() * 100) / 100)));
+    const ks = $c("tk_k").value.split(",").map((s) => Math.max(0, Math.min(L, parseInt(s) || 0)));
+    this.k = Array.from({ length: B }, (_, b) => (ks[b] !== undefined ? ks[b] : ks[ks.length - 1] || 1));
+    this.kmax = Math.max(...this.k);
+    const W = Math.min(this.kmax, L);
+    this.idx = this.conf.map((r) => r.map((v, l) => [v, l]).sort((a, z) => z[0] - a[0] || a[1] - z[1]).slice(0, W).map((a) => a[1]));
+    this.vals = this.idx.map((ix, b) => ix.map((l) => this.conf[b][l]));
+    this.keep0 = this.idx.map((ix, b) => ix.map((_, r) => r < this.k[b]));
+    this.keep1 = this.keep0.map((row, b) => row.map((v, r) => v && this.vals[b][r] > -Infinity));
+    this.final = this.conf.map((r, b) => r.map((_, l) => this.idx[b].some((c, r2) => c === l && this.keep1[b][r2])));
+    this.frames = this.kmax <= 0 ? ["inputs", "init"] : ["inputs", "init", "topk", "keep", "guard", "scatter"];
+  },
+  show(i) {
+    const f = this.frames[i], { B, L, conf, k, kmax, idx, vals, keep0, keep1, final } = this;
+    const cw = Math.max(20, Math.min(40, Math.floor((($c("viz").clientWidth || 520) - 60) / L) - 2));
+    const pos = ["topk", "keep", "guard", "scatter"].includes(f);
+    let h = "";
+    for (let b = 0; b < B; b++) {
+      const cells = [], bools = [];
+      for (let l = 0; l < L; l++) {
+        const c = conf[b][l], rank = idx[b].indexOf(l), inTop = pos && rank >= 0;
+        const kept = f === "scatter" ? final[b][l] : (f === "keep" || f === "guard") && rank >= 0 && (f === "keep" ? keep0 : keep1)[b][rank];
+        const sur = (f === "keep" || f === "guard") && rank >= 0 && !kept;
+        const bh = c === -Infinity ? 0 : Math.max(3, c * 44);
+        cells.push(`<div class="cell ${c === -Infinity ? "mask" : ""} ${kept ? "sel" : ""}" style="height:64px;align-content:end;display:grid;${inTop ? "box-shadow:inset 0 0 0 2px var(--c4);" : ""}${sur ? "opacity:.35;" : ""}" data-tip="row ${b}, col ${l}: ${c === -Infinity ? "−inf (ineligible)" : "confidence " + c}${rank >= 0 && pos ? " · top-k rank " + rank : ""}"><div style="height:${bh}px;width:100%;background:${kept ? "var(--c2)" : "color-mix(in srgb,var(--c1) 55%,var(--surface))"};border-radius:3px 3px 0 0;align-self:end"></div></div>`);
+        const on = f === "scatter" ? final[b][l] : false;
+        bools.push(`<div class="cell ${on ? "done dark" : ""}" style="--f:.6;height:22px;font-size:10px" >${f === "inputs" ? "" : on ? "T" : "F"}</div>`);
+      }
+      const nums = Array.from({ length: L }, (_, l) => `<div class="cell" style="height:16px;font-size:9px;color:var(--muted)">${conf[b][l] === -Infinity ? "−∞" : conf[b][l].toFixed(2).replace(/^0/, "")}</div>`).join("");
+      h += `<div class="seq" style="--T:${L};--cw:${cw}px;margin-bottom:14px"><div class="lab">row ${b} · k = <b>${k[b]}</b></div><div class="row">${cells.join("")}</div><div class="row">${nums}</div>${f === "inputs" ? "" : `<div class="row" style="margin-top:4px">${bools.join("")}</div><div class="mini" style="margin:2px 0 0">transfer[${b}]</div>`}` +
+        (["topk", "keep", "guard"].includes(f) ? `<div class="mini" style="margin-top:6px">idx=${list(idx[b], 0)} · vals=${list(vals[b], 2)}${f !== "topk" ? ` · keep=[${(f === "keep" ? keep0 : keep1)[b].map((v) => (v ? "T" : "F")).join(", ")}]` : ""}</div>` : "") + "</div>";
+    }
+    $c("viz").innerHTML = h;
+    const cap = { inputs: `<b>inputs</b> · <code>confidence [B, L]</code> with <code>−inf</code> on ineligible positions, and how many positions <code>k[b]</code> each row must select.`,
+      init: kmax <= 0 ? `<b>init</b> · <code>k_max = 0</code>: nothing to select, return the all-False mask immediately.` : `<b>init</b> · start from an all-False mask.`,
+      topk: `<b>topk</b> · ONE batched <code>torch.topk</code> with <code>k_max = ${kmax}</code> (the largest k in the batch) — no loop over rows. Purple outline = each row's ${kmax} best columns.`,
+      keep: `<b>keep</b> · row <i>b</i> only wants <code>k[b]</code> of those ${kmax}: <code>arange(k_max) &lt; k[:, None]</code> keeps the first <code>k[b]</code> ranks and discards the surplus.`,
+      guard: `<b>guard</b> · <code>keep &amp;= vals &gt; −inf</code>: a top-k slot that only holds an ineligible position is dropped (a row with fewer candidates than k).`,
+      scatter: `<b>scatter</b> · write <code>keep</code> into the mask at columns <code>idx</code>. Rows end with exactly <code>min(k[b], #eligible)</code> True entries.` }[f];
+    $c("cap").innerHTML = cap;
+    cp.hl(f === "inputs" ? [] : [f]);
+    watch($c("watch"), { inputs: [["confidence", `[${B}, ${L}]`], ["k", list(k, 0)], ["k_max", kmax]], init: [["transfer", `[${B}, ${L}] all False`], ["k_max", kmax, kmax <= 0 ? "→ early return" : ""]],
+      topk: [["vals", `[${B}, ${Math.min(kmax, L)}]`], ["idx", `[${B}, ${Math.min(kmax, L)}]`]],
+      keep: [["arange(k_max)", list([...Array(Math.min(kmax, L)).keys()], 0)], ["k[:, None]", list(k, 0)], ["keep", `[${B}, ${Math.min(kmax, L)}] bool`]],
+      guard: [["vals > −inf", "drops ineligible slots"], ["kept slots", keep1.map((r) => r.filter(Boolean).length).join(", "), "per row"]],
+      scatter: [["transfer.sum(1)", list(final.map((r) => r.filter(Boolean).length), 0), "selected per row"]] }[f]);
+  },
+};
+
+/* =========================================================
+   3 · add_gumbel_noise
+   ========================================================= */
+const CODE_GUMBEL = `def add_gumbel_noise(logits, temperature):
+@t0|    if temperature == 0:
+@t0|        return logits                                   # greedy: plain argmax
+@cast|    logits = logits.to(torch.float64)
+@noise|    noise = torch.rand_like(logits, dtype=torch.float64)   # u ~ Uniform(0, 1)
+@add|    return logits - temperature * torch.log(-torch.log(noise))
+@add|    #        = logits + temperature * Gumbel(0, 1)
+
+# in the sampler:
+@pick|x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1)`;
+function svgBars(vals, o = {}) {
+  const W = 460, H = 165, pad = 40, n = vals.length, mn = Math.min(0, ...vals), mx = Math.max(0.0001, ...vals), sy = (v) => 12 + ((mx - v) / (mx - mn || 1)) * (H - pad - 12), bw = (W - 20) / n;
+  let g = `<line class="axis" x1="10" x2="${W - 10}" y1="${sy(0)}" y2="${sy(0)}"/>`;
+  vals.forEach((v, i) => {
+    const x = 10 + i * bw + bw * 0.15, w = bw * 0.7, y0 = sy(0), y1 = sy(v), on = o.hi === i;
+    g += `<rect x="${x}" y="${Math.min(y0, y1)}" width="${w}" height="${Math.max(1, Math.abs(y1 - y0))}" rx="3" fill="${on ? "var(--c2)" : o.color || "var(--c1)"}"/>`;
+    g += `<text x="${x + w / 2}" y="${H - 8}" text-anchor="middle" style="font-size:12px;fill:var(--ink2)">${TOK[i]}</text><text x="${x + w / 2}" y="${(v >= 0 ? y1 - 4 : y1 + 13)}" text-anchor="middle" style="font-size:10.5px">${(o.fmt || ((z) => z.toFixed(2)))(v)}</text>`;
+  });
+  return `<div class="chart"><svg viewBox="0 0 ${W} ${H}" style="max-width:${W + 40}px">${g}</svg></div>`;
+}
+function softmaxT(l, T) { const z = l.map((v) => v / T), m = Math.max(...z), e = z.map((v) => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0); return e.map((v) => v / s); }
+const GUMBEL = {
+  code: CODE_GUMBEL, title: "dllm/core/samplers/utils.py · add_gumbel_noise", ctl: "ctl_gumbel", seed: 2,
+  build() {
+    this.logits = $c("g_logits").value.split(",").map((s) => parseFloat(s)).filter((v) => !isNaN(v)).slice(0, 8);
+    if (this.logits.length < 2) this.logits = [1, 0];
+    this.T = +$c("g_T").value; const rnd = mulberry32(this.seed), V = this.logits.length;
+    this.u = this.logits.map(() => Math.min(0.999, Math.max(0.001, rnd())));
+    this.g = this.u.map((u) => -Math.log(-Math.log(u)));
+    this.pert = this.logits.map((l, i) => (this.T === 0 ? l : l + this.T * this.g[i]));
+    this.arg = this.pert.indexOf(Math.max(...this.pert));
+    // many draws
+    const r2 = mulberry32(99), N = 4000, cnt = new Array(V).fill(0);
+    for (let n = 0; n < N; n++) { let best = -Infinity, bi = 0; for (let i = 0; i < V; i++) { const v = this.T === 0 ? this.logits[i] : this.logits[i] + this.T * -Math.log(-Math.log(Math.min(0.999999, Math.max(1e-9, r2())))); if (v > best) { best = v; bi = i; } } cnt[bi]++; }
+    this.emp = cnt.map((c) => c / N); this.N = N;
+    this.theory = this.T === 0 ? this.logits.map((l) => (l === Math.max(...this.logits) ? 1 : 0)) : softmaxT(this.logits, this.T);
+    this.frames = this.T === 0 ? ["logits", "greedy", "many"] : ["logits", "noise", "gumbel", "add", "pick", "many"];
+  },
+  show(i) {
+    const f = this.frames[i], { logits, T, u, g, pert, arg, emp, theory, N } = this; let viz = "", cap = "", w = [], tags = [];
+    const lbl = (t) => `<div class="mini" style="margin-top:8px">${t}</div>`;
+    if (f === "logits") { cap = "<b>logits</b> · the model's raw scores for one position. Without noise, <code>argmax</code> would always pick the same token."; viz = lbl("logits") + svgBars(logits, { hi: undefined }); w = [["logits", list(logits, 2)], ["temperature", T]]; tags = []; }
+    else if (f === "greedy") { cap = "<b>temperature = 0</b> · <code>add_gumbel_noise</code> returns the logits untouched, so <code>argmax</code> is greedy decoding."; viz = lbl("logits (unchanged)") + svgBars(logits, { hi: logits.indexOf(Math.max(...logits)) }); w = [["returned", "logits", "no noise added"], ["argmax", TOK[logits.indexOf(Math.max(...logits))]]]; tags = ["t0", "pick"]; }
+    else if (f === "noise") { cap = "<b>noise</b> · one uniform random number <code>u</code> per vocabulary entry."; viz = lbl("logits") + svgBars(logits) + lbl("u ~ Uniform(0, 1)") + svgBars(u, { color: "var(--c4)" }); w = [["u", list(u, 3)]]; tags = ["cast", "noise"]; }
+    else if (f === "gumbel") { cap = "<b>Gumbel noise</b> · <code>−log(−log u)</code> turns uniform noise into Gumbel(0, 1) noise (heavy right tail: occasionally a big boost)."; viz = lbl("u") + svgBars(u, { color: "var(--c4)" }) + lbl("g = −log(−log u)") + svgBars(g, { color: "var(--c3)" }); w = [["u", list(u, 3)], ["g", list(g, 3)]]; tags = ["add"]; }
+    else if (f === "add") { cap = `<b>add</b> · <code>logits + T·g</code> with <b>T = ${T}</b>. Higher temperature = more noise = more randomness.`; viz = lbl("logits") + svgBars(logits) + lbl(`logits + ${T}·g`) + svgBars(pert, { color: "var(--c3)" }); w = [["T", T], ["logits + T·g", list(pert, 2)]]; tags = ["add"]; }
+    else if (f === "pick") { cap = `<b>argmax</b> · the sampler takes the argmax of the perturbed scores: token <b>${TOK[arg]}</b> this time. Press “resample noise” for another draw.`; viz = lbl("logits + T·g") + svgBars(pert, { hi: arg, color: "var(--c3)" }); w = [["argmax", TOK[arg]], ["x0", arg]]; tags = ["pick"]; }
+    else { cap = `<b>many draws</b> · repeat with fresh noise ${N.toLocaleString()} times: token <i>i</i> wins with probability <code>softmax(logits / T)ᵢ</code>. Gumbel-max is a way to <i>sample</i> from a categorical distribution using only <code>argmax</code>.`;
+      const V = logits.length; let h = ""; for (let i = 0; i < V; i++) h += `<div class="mini" style="margin-top:6px">${TOK[i]} · empirical <b>${(emp[i] * 100).toFixed(1)}%</b> · softmax(logits/T) ${(theory[i] * 100).toFixed(1)}%</div><div class="bar1" style="height:14px"><i style="width:${emp[i] * 100}%;background:var(--c2)"></i></div><div class="bar1" style="height:6px;margin-top:2px"><i style="width:${theory[i] * 100}%;background:var(--c1)"></i></div>`;
+      viz = h + `<div class="legend"><span><i class="sw" style="background:var(--c2)"></i>empirical (argmax of noisy logits)</span><span><i class="sw" style="background:var(--c1)"></i>softmax(logits / T)</span></div>`; w = [["T", T, T === 0 ? "one-hot" : ""], ["softmax(logits/T)", list(theory, 3)]]; tags = ["pick"]; }
+    $c("cap").innerHTML = cap; $c("viz").innerHTML = viz; watch($c("watch"), w); cp.hl(tags);
+  },
+};
+
+/* =========================================================
+   tabs + shared stepper
+   ========================================================= */
+const MODS = { counts: COUNTS, topk: TOPK, gumbel: GUMBEL };
+let curMod = "counts", cp = null;
+const st = stepper($c("stp"), (i) => { const M = MODS[curMod]; if (M.frames && M.frames[i] !== undefined) M.show(i); }, 700);
+function activate(name, keepFrame) {
+  curMod = name; const M = MODS[name];
+  for (const k in MODS) { $c("ctl_" + k).hidden = k !== name; $c("tab_" + k).classList.toggle("on", k === name); }
+  $c("code").innerHTML = ""; cp = codePanel($c("code"), M.title, M.code);
+  M.build(); st.setN(M.frames.length, keepFrame);
+}
+for (const k in MODS) $c("tab_" + k).onclick = () => activate(k, false);
+const rebuild = () => { MODS[curMod].build(); st.setN(MODS[curMod].frames.length, true); };
+["counts", "sched", "sto", "tk_k", "g_logits"].forEach((id) => $c(id).addEventListener("input", rebuild));
+["steps", "tk_B", "tk_L", "tk_inf", "g_T"].forEach((id) => bindRange(id, rebuild));
+$c("tk_re").onclick = () => { TOPK.seed++; rebuild(); };
+$c("g_re").onclick = () => { GUMBEL.seed++; rebuild(); };
+activate(["counts", "topk", "gumbel"].includes(EMBED) ? EMBED : "counts", false);
+</script>
+</main></body></html>

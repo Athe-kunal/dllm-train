@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en" class="blog"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Samplers and schedulers in diffusion language models</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+
+<h1>Samplers and schedulers in diffusion language models</h1>
+
+<!-- ===================== SCHEDULERS ===================== -->
+<h2>Schedulers</h2>
+
+<p>A masked diffusion language model is trained to repair text in which random tokens have been replaced by <code>[MASK]</code>. The <b>scheduler</b> is the rule for how much text is masked at each point of a continuous “time” <i>t</i> between 0 (clean text) and 1 (nothing but masks). Its value, <i>α(t)</i>, is the probability that a token has survived.</p>
+
+<p>Generation runs the clock backwards: start at <i>t = 1</i> with an empty canvas, and step towards <i>t = 0</i>, revealing a few tokens at each step. The scheduler is what tells the sampler <i>how many</i>.</p>
+
+<figure>
+  <iframe data-embed="schedulers.html?embed=alpha" title="Scheduler explorer" height="320" loading="lazy"></iframe>
+  <figcaption>Drag <i>t</i> and <i>s</i>, switch schedulers, and watch which lines of the real code produce the numbers. <a href="schedulers.html">Open full page</a></figcaption>
+</figure>
+
+<p>Two things to try. Compare Linear and Cosine at the same <i>t</i>: one corrupts text at a constant rate, the other front-loads it. Then pull <i>s</i> up to <i>t</i> and watch the reveal probability collapse. A tiny time step reveals almost nothing, which is why the number of sampling steps matters.</p>
+
+<h3>The one line the sampler needs</h3>
+
+<p>Of everything a scheduler offers, sampling uses a single quantity, <code>reverse_mask_prob(s, t)</code> for <i>s &lt; t</i>. Its formula looks arbitrary until you notice that masking is absorbing: a token that is masked never becomes unmasked as time increases. So a token masked at the earlier time <i>s</i> was necessarily also masked at <i>t</i>, and the conditional probability is just a ratio of marginals:</p>
+
+<div class="eq">P(masked at s | masked at t) = P(masked at s) / P(masked at t) = (1 − α(s)) / (1 − α(t))</div>
+
+<p>One minus this is the chance that a masked token gets revealed in that step. That is the number handed to the next stage of the sampler.</p>
+
+<h3>Why there is also a derivative</h3>
+
+<p>Every scheduler implements two hooks, <code>_value</code> and <code>_derivative</code>, and the sampler never calls the second one. It exists for training. When the model is trained to fill in masked tokens, the loss at a time <i>t</i> is weighted by <i>w(t) = −α′(t) / (1 − α(t))</i>, which is why <code>weight()</code> needs the slope. In other words, the scheduler is shared between the two halves of the system: training uses its slope to decide how much each noise level counts, and sampling uses its value to decide how fast to denoise.</p>
+
+<p>The <code>kappa</code> schedulers next to it have the same shape but belong to a different model family (edit flows), so the samplers ignore them.</p>
+
+<!-- ===================== SAMPLERS ===================== -->
+<h2 id="samplers">Samplers</h2>
+
+<p>The scheduler says how much to reveal; the <b>sampler</b> does the revealing. Both samplers in this codebase share one skeleton: put the prompt and a run of <code>[MASK]</code> tokens on a canvas, then repeat <i>predict every masked position, keep a few predictions, write them into the canvas</i> until no masks are left. What differs is what the model is allowed to see, and therefore what can be cached.</p>
+
+<h3 id="counts">How many tokens per step</h3>
+
+<p>The scheduler gives a probability per step, but the sampler needs whole numbers per batch row. <code>get_num_transfer_tokens</code> does the conversion, and two of its design choices are not visible in the numbers alone.</p>
+
+<ul>
+  <li><b>It is a recurrence, not a formula.</b> Step <i>j</i> reveals <code>round(remaining × p<sub>j</sub>)</code>, and <i>remaining</i> depends on the rounding of every earlier step, so the steps cannot be computed independently. The probabilities can, so they come from one scheduler call and only the cheap rounding loop stays sequential.</li>
+  <li><b>Empty steps are dropped.</b> These models are not conditioned on the diffusion time, so a step that reveals nothing would be a full forward pass over an unchanged input. The function packs each row's non-empty steps to the left and trims the rest, which also lets rows with few masks finish early.</li>
+</ul>
+
+<p>With <code>stochastic_transfer</code> the rounding is replaced by a Binomial draw, so the counts themselves, not only the chosen tokens, become random.</p>
+
+<figure>
+  <iframe data-embed="utils.html?embed=counts" title="get_num_transfer_tokens step-through" height="320" loading="lazy"></iframe>
+  <figcaption>Step through it with the buttons or ← →, and change the number of masks per row or the scheduler. <a href="utils.html">Open full page</a></figcaption>
+</figure>
+
+<h3 id="topk">Which tokens: a batched top-k</h3>
+
+<p>Once we know that row <i>b</i> should reveal <i>k[b]</i> tokens this step, we have to choose <i>which</i>: the <i>k[b]</i> masked positions the model is most confident about. The obvious code loops over rows and calls <code>torch.topk</code> with a different <i>k</i> each time, which launches one tiny kernel per row and, because <i>k[b]</i> lives on the GPU, waits for the device once per row.</p>
+
+<p><code>topk_transfer_mask</code> does it with a single call. It takes the top <code>k_max</code> of every row, where <code>k_max</code> is the largest <i>k</i> in the batch, and then masks out the surplus in rows that wanted fewer. Two details matter. <code>k_max</code> is passed in as a plain Python integer, computed once per block, so the function itself never has to wait on the GPU. And positions with confidence <code>−inf</code> (not masked, or outside the current block) are never selected, so a row with fewer candidates than <i>k</i> simply selects fewer.</p>
+
+<figure>
+  <iframe data-embed="utils.html?embed=topk" title="topk_transfer_mask step-through" height="320" loading="lazy"></iframe>
+  <figcaption>Try <i>k</i> values that differ a lot between rows, or raise the share of ineligible positions until a row runs out of candidates. <a href="utils.html">Open full page</a></figcaption>
+</figure>
+
+<h3 id="gumbel">Greedy or sampled: Gumbel noise</h3>
+
+<p>The model outputs a score for every vocabulary entry at every masked position, and something has to turn those scores into a proposed token. At temperature 0 that is a plain <code>argmax</code>. Otherwise the sampler adds Gumbel noise to the logits first, scaled by the temperature, and takes the <code>argmax</code> of the result. The useful fact is that this is <i>exactly</i> sampling from <code>softmax(logits / T)</code>, so a categorical draw is reduced to an <code>argmax</code>, which is cheap and batches well.</p>
+
+<p>Note what the noise does <i>not</i> touch. The proposed token comes from the noisy logits, but the confidence used to rank positions is the probability of that token under the <i>clean</i> logits. Randomness therefore changes what is proposed without changing how sure the model is about it. The noise is generated in float64: in the masked-diffusion setting, lower precision improves perplexity but hurts generation quality (arXiv:2409.02908).</p>
+
+<figure>
+  <iframe data-embed="utils.html?embed=gumbel" title="add_gumbel_noise step-through" height="320" loading="lazy"></iframe>
+  <figcaption>Change the temperature and press “resample noise”; the last frame checks the claim above against thousands of draws. <a href="utils.html">Open full page</a></figcaption>
+</figure>
+
+<h3 id="mdlm">MDLM: read everything, commit a block</h3>
+
+<p>MDLM decoding treats the model as a plain bidirectional denoiser. It was trained on randomly masked text and knows nothing about blocks; blocks exist only in the sampler, as a restriction on which positions may be committed. Each step the model predicts every masked position, the confidence of those predictions ranks them, and the top <i>k</i> inside the current block are kept. The others are not stored anywhere. They stay masked and are predicted again next step, which is all that “remasking” means here.</p>
+
+<p>Why restrict to a block at all? In LLaDA's experiments, letting confidence pick from the whole canvas tends to commit the padding and end-of-sequence positions at the far end first, because the model is very sure about them, and the answer gets cut short. Decoding blocks left to right avoids that while still filling each block in parallel.</p>
+
+<figure>
+  <iframe data-embed="mdlm.html?embed=1" title="MDLM sampler" height="320" loading="lazy"></iframe>
+  <figcaption>Each decode step is six frames; the highlighted lines are the code running at that moment. The second tab lets you inspect the block windows. <a href="mdlm.html">Open full page</a></figcaption>
+</figure>
+
+<p>Two consequences show up in the counters. First, <b>the forward pass can never shrink</b>. Attention is bidirectional, so committing a single token changes the hidden state of every position, the prompt included, and no key or value can be reused. Every step costs <code>B × T</code> tokens. Second, <b>everything after the forward pass only needs the current block</b>. The noise, <code>argmax</code> and <code>softmax</code> over the vocabulary can run on a slice of the columns instead of the whole canvas, and that is where an implementation can save work.</p>
+
+<h3 id="bd3lm">BD3LM: block-causal, so the past can be cached</h3>
+
+<p>Block diffusion changes the model, not just the sampler. It is trained with a block-causal attention mask: a token sees its own block and all earlier blocks, never later ones. Two things follow. The canvas can grow one block at a time and stop early on EOS. And a finished block's keys and values can never change again, so they can live in a KV cache, which is exactly what MDLM cannot have.</p>
+
+<p>The sampler manages that cache with three operations: <b>prefill</b> the prompt once, <b>roll back</b> after every denoising step, and <b>extend</b> once per finished block. The rollback is the subtle one. Hugging Face style caches are updated in place by any forward pass, even one called with <code>use_cache=False</code>, so a denoising step would otherwise leave its tentative block keys and values behind. The simple fix is to deep-copy the whole cache before every step; cropping it back afterwards does the same job without the copy.</p>
+
+<figure>
+  <iframe data-embed="bd3lm.html?embed=1" title="BD3LM sampler" height="320" loading="lazy"></iframe>
+  <figcaption>The strip under the canvas is the KV cache: watch it gain a temporary block during the forward and lose it on the rollback. The second tab is the block-causal mask. <a href="bd3lm.html">Open full page</a></figcaption>
+</figure>
+
+<p>The counters compare against the straightforward implementation, which re-encodes the entire prefix at the start of every block and deep-copies the cache at every step. Re-encoding makes total prefill work grow quadratically with the number of blocks instead of linearly; the copies multiply memory traffic by the prefix length.</p>
+
+<h3 id="compare">The two side by side</h3>
+
+<div class="tblwrap"><table>
+  <tr><th></th><th>MDLM</th><th>BD3LM</th></tr>
+  <tr><td>What the model sees</td><td>The whole canvas, future masks included</td><td>The prefix and the current block</td></tr>
+  <tr><td>Attention</td><td>Bidirectional</td><td>Block-causal, bidirectional inside a block</td></tr>
+  <tr><td>KV cache</td><td>Not possible</td><td>Prefix is cached</td></tr>
+  <tr><td>Sequence length</td><td>Fixed up front</td><td>Grows one block at a time, can stop on EOS</td></tr>
+  <tr><td>Blocks are…</td><td>A sampling schedule</td><td>Part of the model</td></tr>
+</table></div>
+
+
+</main>
+<script>
+// Each visualization is an iframe that reports its own height (see EMBED in assets/common.js).
+document.querySelectorAll("iframe[data-embed]").forEach((f) => { f.src = f.dataset.embed; });
+addEventListener("message", (e) => {
+  if (!e.data || !e.data.embedHeight) return;
+  document.querySelectorAll("iframe[data-embed]").forEach((f) => { if (f.contentWindow === e.source) f.style.height = e.data.embedHeight + 2 + "px"; });
+});
+</script>
+</body></html>

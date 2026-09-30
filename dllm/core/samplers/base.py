@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, replace
 
 import torch
 from transformers import PreTrainedModel, PreTrainedTokenizer
@@ -16,6 +16,11 @@ class BaseSamplerOutput:
 @dataclass
 class BaseSamplerConfig:
     return_dict: bool = False
+
+    def override(self, **kwargs):
+        """Copy of this config with the matching fields replaced; unknown keys are ignored."""
+        names = {f.name for f in fields(self)}
+        return replace(self, **{k: v for k, v in kwargs.items() if k in names})
 
 
 @dataclass

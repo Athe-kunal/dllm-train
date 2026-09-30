@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>dllm core visualizations</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("index.html"))</script>
+<h1>dllm core: samplers &amp; schedulers</h1>
+<p class="sub">Each page steps through the real code: the visualization on the left, the lines being executed and the live variables on the right.</p>
+
+<div class="flow" style="margin:6px 0 18px">
+  <div class="box"><b>schedulers</b><small>α(t) → reverse_mask_prob</small></div><div class="arr">→</div>
+  <div class="box"><b>utils</b><small>counts · top-k · Gumbel noise</small></div><div class="arr">→</div>
+  <div class="box"><b>MDLM</b><small>full canvas, block window</small></div>
+  <div class="box"><b>BD3LM</b><small>block-causal + KV cache</small></div>
+</div>
+
+<div class="grid2">
+  <a class="card" href="schedulers.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">Schedulers →</h3>Drag t and s: α, its derivative, the loss weight, and the per-step reveal probability.</a>
+  <a class="card" href="utils.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">samplers/utils →</h3>The three building blocks: tokens-per-step counts, batched top-k selection, and Gumbel noise.</a>
+  <a class="card" href="mdlm.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">MDLM sampler →</h3>Every decode step in 6 phases: forward, slice, predict, confidence, top-k, commit.</a>
+  <a class="card" href="bd3lm.html" style="text-decoration:none;color:inherit"><h3 style="margin-top:0">BD3LM sampler →</h3>Prefill, denoise with the cache, rollback, extend — plus the attention-mask explorer.</a>
+</div>
+<p style="color:var(--muted);font-size:13px;margin-top:18px">Keys: ← / → step through frames.</p>
+</main></body></html>

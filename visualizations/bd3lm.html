@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BD3LM sampler — dllm/core/samplers/bd3lm.py</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("bd3lm.html"))</script>
+
+<h1>BD3LM sampler</h1>
+<p class="sub">Block diffusion: the model only sees the prefix and the current block, so the prefix's keys/values live in a KV cache. Step with ← →</p>
+
+<div class="tabs"><button id="tab_dec" class="on">Decode</button><button id="tab_mask">Attention mask</button></div>
+
+<!-- ================= DECODE ================= -->
+<div id="pg_dec">
+  <div class="panel">
+    <div class="controls">
+      <label>prompt lens <input type="text" id="b_pls" value="5,2" style="width:70px"></label>
+      <label>max_new_tokens <input type="range" id="b_mnt" min="4" max="32" value="16"><output id="b_mnt_o"></output></label>
+      <label>block_size <input type="range" id="b_bs" min="1" max="8" value="4"><output id="b_bs_o"></output></label>
+      <label>steps <input type="range" id="b_steps" min="1" max="24" value="8"><output id="b_steps_o"></output></label>
+      <label>P(EOS) % <input type="range" id="b_eos" min="0" max="15" value="0"><output id="b_eos_o"></output></label>
+      <label><span>CFG</span><input type="checkbox" id="b_cfg"></label>
+      <label><span>micro-steps</span><input type="checkbox" id="b_micro" checked></label>
+    </div>
+    <div id="stp" style="margin-top:12px"></div>
+  </div>
+  <div class="split" style="margin-top:14px">
+    <div>
+      <div class="cap" id="cap"></div>
+      <div class="panel">
+        <div class="seqs" id="seqs"></div>
+        <div id="counters" style="margin-top:10px"></div>
+        <div class="legend" style="margin-top:8px">
+          <span><i class="sw" style="background:var(--pad);border:1px dashed var(--line2)"></i>left pad</span>
+          <span><i class="sw" style="background:var(--prompt)"></i>prompt</span>
+          <span><i class="sw" style="border:1px dashed var(--c2)"></i>masked</span>
+          <span><i class="sw" style="background:color-mix(in srgb,var(--c1) 40%,var(--surface))"></i>committed</span>
+          <span><i class="sw" style="background:color-mix(in srgb,var(--c4) 38%,var(--surface))"></i>in KV cache</span>
+          <span><i class="sw" style="border:1px dashed var(--c4)"></i>temporary K/V from this step</span>
+          <span><i class="sw" style="background:var(--c3);height:4px"></i>block being denoised</span>
+        </div>
+      </div>
+    </div>
+    <div class="sticky"><div id="code"></div><div id="code2"></div><div id="watch"></div></div>
+  </div>
+</div>
+
+<!-- ================= MASK ================= -->
+<div id="pg_mask" hidden>
+  <div class="panel">
+    <div class="controls">
+      <label>prompt lens <input type="text" id="a_pls" value="5,2" style="width:70px"></label>
+      <label>block_size <input type="range" id="a_bs" min="1" max="8" value="4"><output id="a_bs_o"></output></label>
+      <label>generated blocks <input type="range" id="a_gb" min="0" max="3" value="2"><output id="a_gb_o"></output></label>
+      <label>row <select id="a_row"></select></label>
+      <label><span>q_start: rows of one block only</span><input type="checkbox" id="a_qs"></label>
+      <label>block <input type="range" id="a_qb" min="0" max="5" value="2"><output id="a_qb_o"></output></label>
+    </div>
+  </div>
+  <div class="split" style="margin-top:14px">
+    <div>
+      <div class="cap" id="a_cap">Hover a cell: query row → key column.</div>
+      <div class="panel" style="overflow-x:auto"><div id="a_mat"></div>
+        <div class="legend" style="margin-top:8px"><span><i class="sw" style="background:color-mix(in srgb,var(--c1) 70%,var(--surface))"></i>may attend</span><span><i class="sw" style="background:var(--c2)"></i>hovered row</span><span>numbers = block id ( – = padding)</span></div>
+        <div id="a_info" style="margin-top:10px"></div></div>
+    </div>
+    <div class="sticky"><div id="a_code"></div><div id="a_watch"></div></div>
+  </div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+const parsePls = (v) => { const a = v.split(",").map((s) => Math.max(1, parseInt(s) || 1)).slice(0, 4); return a.length ? a : [4]; };
+
+/* ---------- tabs ---------- */
+$c("tab_dec").onclick = () => { $c("pg_dec").hidden = false; $c("pg_mask").hidden = true; $c("tab_dec").classList.add("on"); $c("tab_mask").classList.remove("on"); };
+$c("tab_mask").onclick = () => { $c("pg_dec").hidden = true; $c("pg_mask").hidden = false; $c("tab_mask").classList.add("on"); $c("tab_dec").classList.remove("on"); renderA(); };
+
+/* ---------- code ---------- */
+const CODE_MAIN = `# 1 · encode the prompt once
+@prefill|cond_past, cond_last = self._extend_cache(x, prompt_attn, prompt_pos, None)
+
+for b_idx in range(num_blocks):
+@append|    T_prefix = x.shape[1]
+@append|    x = torch.cat([x, masks_for_new_block], dim=1)
+@append|    T_total = x.shape[1]
+@append|    attn_block, full_pos = _prepare_for_sampling(x, ..., q_start=T_prefix)  # block rows only
+@append|    num_transfer_tokens = get_num_transfer_tokens(...)
+
+    for i_step in range(effective_steps):
+@fwd|        x_block = x[:, T_prefix:T_total]
+@fwd|        logits = self.model(x_block, attention_mask=attn_block,
+@fwd|                            position_ids=pos_block,
+@fwd|                            past_key_values=_fork_cache(cond_past),
+@fwd|                            use_cache=False).logits
+@rollback|        _rollback_cache(cond_past, T_prefix)
+@select|        x[:, T_prefix:T_total] = _diffusion_step_block(logits, x_block, ...)
+
+@done|    done = done | (x[:, T_prefix:T_total] == eos_id).any(dim=1)
+@done|    if b_idx + 1 == num_blocks or done.all():
+@done|        break
+@extend|    cond_past, cond_last = self._extend_cache(
+@extend|        x[:, T_prefix:T_total], attn_block, pos_block, cond_past)`;
+const CODE_HELP = `def _fork_cache(cache):
+@fwd|    if hasattr(cache, "crop") or isinstance(cache, tuple):
+@fwd|        return cache                       # same object, rolled back later
+@fwd|    return copy.deepcopy(cache)            # fallback
+
+def _rollback_cache(cache, length):
+@rollback|    if hasattr(cache, "crop"):
+@rollback|        cache.crop(length)                 # drop this step's K/V
+
+def _extend_cache(self, tokens, attn, pos, past):
+@prefill,extend|    out = self.model(tokens, attention_mask=attn, position_ids=pos,
+@prefill,extend|                     past_key_values=past, use_cache=True)
+@prefill,extend|    return out.past_key_values, out.logits[:, -1:, :]`;
+const cpMain = codePanel($c("code"), "bd3lm.py · BD3LMSampler.sample", CODE_MAIN);
+const cpHelp = codePanel($c("code2"), "cache helpers", CODE_HELP);
+
+/* ---------- decode simulation ---------- */
+let allF = [], F = [], M = {};
+function simB(cfg) {
+  const rnd = mulberry32(5), S = ALPHA.linear, B = cfg.pls.length, bs = cfg.bs, mult = cfg.cfg ? 2 : 1;
+  const maxPl = Math.max(...cfg.pls), padded = Math.ceil(maxPl / bs) * bs, Tfin = padded + cfg.maxNew;
+  const nb = Math.ceil(cfg.maxNew / bs), spb = Math.ceil(cfg.steps / nb);
+  const st = cfg.pls.map((L) => Array.from({ length: padded }, (_, p) => (p < padded - L ? 4 : 0)));
+  const cs = cfg.pls.map(() => new Array(Tfin).fill(-1)), eosCell = cfg.pls.map(() => new Set());
+  let done = new Array(B).fill(false), gen = 0, g = 0, cnow = B * padded * mult, cold = B * padded * mult, cpNow = 0, cpOld = 0, cache = padded;
+  const snap = (x) => ({ st: st.map((r) => r.slice()), cs: cs.map((r) => r.slice()), eosCell: eosCell.map((s) => new Set(s)), len: st[0].length, cnow, cold, cpNow, cpOld, cache, ...x });
+  const out = [snap({ phase: "prefill", tmp: 0, note: `${B}×${padded} tokens` })];
+  for (let b = 0; b < nb; b++) {
+    if (done.every(Boolean)) break;
+    const P = st[0].length, cl = Math.min(bs, cfg.maxNew - gen); if (cl <= 0) break;
+    if (b > 0) cold += B * P * mult;
+    for (let j = 0; j < B; j++) for (let i = 0; i < cl; i++) st[j].push(1);
+    const nt = numTransfer(new Array(B).fill(cl), spb, S, false, rnd);
+    const ctx = { b, nb, lo: P, hi: P + cl, P, cl, eff: nt.maxLen };
+    out.push(snap({ phase: "append", tmp: 0, ...ctx }));
+    for (let i = 0; i < nt.maxLen; i++) {
+      cnow += B * cl * mult; cold += B * cl * mult; cpNow += B * P * mult; cpOld += 2 * B * P * mult;
+      const conf = [], sel = [];
+      for (let j = 0; j < B; j++) {
+        const c = new Array(Tfin).fill(-Infinity);
+        for (let p = P; p < P + cl; p++) if (st[j][p] === 1) c[p] = rnd();
+        conf.push(c);
+        sel.push(c.map((v, p) => [v, p]).filter((a) => a[0] > -Infinity).sort((a, z) => z[0] - a[0]).slice(0, nt.packed[j][i]).map((a) => a[1]));
+      }
+      const c2 = { ...ctx, i, conf, sel, k: nt.packed.map((r) => r[i]) };
+      out.push(snap({ phase: "fwd", tmp: cl, ...c2 }));
+      out.push(snap({ phase: "rollback", tmp: 0, ...c2 }));
+      for (let j = 0; j < B; j++) for (const p of sel[j]) { st[j][p] = 3; cs[j][p] = g; if (rnd() < cfg.eos / 100) eosCell[j].add(p); }
+      g++;
+      out.push(snap({ phase: "select", tmp: 0, ...c2 }));
+    }
+    for (let j = 0; j < B; j++) for (const p of eosCell[j]) if (p >= P) done[j] = true;
+    gen += cl;
+    const last = b + 1 === nb || done.every(Boolean);
+    if (last) out.push(snap({ phase: "done", tmp: 0, last: true, ...ctx }));
+    else { cnow += B * cl * mult; cache = P + cl; out.push(snap({ phase: "extend", tmp: 0, ...ctx })); }
+  }
+  return { frames: out, meta: { B, Tfin, padded, nb, spb, cfg, total: g } };
+}
+function readB() { return { pls: parsePls($c("b_pls").value), maxNew: +$c("b_mnt").value, bs: +$c("b_bs").value, steps: +$c("b_steps").value, eos: +$c("b_eos").value, cfg: $c("b_cfg").checked }; }
+function rebuildB() { const r = simB(readB()); allF = r.frames; M = r.meta; applyMicro(); }
+function applyMicro() { F = $c("b_micro").checked ? allF : allF.filter((f) => ["prefill", "append", "select", "extend", "done"].includes(f.phase)); st.setN(F.length, false); }
+
+const CAPB = {
+  prefill: (f) => `<b>prefill</b> · the prompt is encoded <i>once</i>; the KV cache now holds <b>${f.cache}</b> tokens per row.`,
+  append: (f) => `<b>block ${f.b + 1}/${f.nb}</b> · append ${f.cl} masks. No model call yet; the cache still holds ${f.P} tokens.`,
+  fwd: (f) => `<b>forward</b> · only the ${f.cl} block tokens go through the model, attending to the ${f.P}-token cache. The forward also appends their K/V to the cache <i>temporarily</i>.`,
+  rollback: (f) => `<b>rollback</b> · a denoising step must not change the cache: <code>crop</code> it back to ${f.P} tokens (before: a deepcopy every step).`,
+  select: (f) => `<b>select</b> · top-k per row → commit (k = [${f.k.join(", ")}]). Step ${f.i + 1}/${f.eff}.`,
+  extend: (f) => `<b>extend</b> · the finished block runs through the model <i>once</i> and joins the cache (${f.P} → ${f.P + f.cl}). Its K/V never change again, because later blocks can't affect it.`,
+  done: (f) => `<b>done</b> · last block (or all rows hit EOS) — no extension needed.`,
+};
+function showB(i) {
+  const f = F[i]; if (!f) return;
+  const { B, Tfin } = M, ph = f.phase, cw = Math.max(10, Math.min(30, Math.floor(($c("seqs").clientWidth || 560) / Tfin) - 2)), totalAll = Math.max(1, M.total - 1);
+  let h = "";
+  for (let j = 0; j < B; j++) {
+    const cells = [], bars = [], win = [];
+    for (let p = 0; p < Tfin; p++) {
+      const s = p < f.len ? f.st[j][p] : -1, sel = (ph === "select") && f.sel[j].includes(p);
+      let cls = "cell", txt = "", tip = `row ${j}, col ${p}`;
+      if (s === -1) cls += " none"; else if (s === 4) { cls += " pad"; txt = "·"; } else if (s === 0) { cls += " prompt"; txt = "P"; } else if (s === 1) cls += " mask";
+      else { const eos = f.eosCell[j].has(p); cls += eos ? " eostok" : " done" + (f.cs[j][p] / totalAll > 0.55 ? " dark" : ""); txt = eos ? "E" : f.cs[j][p]; }
+      if (sel) cls += " sel";
+      const c = f.conf && f.conf[j][p], showBar = ph === "select" && c > -Infinity;
+      cells.push(`<div class="${cls}" style="--f:${s === 3 ? f.cs[j][p] / totalAll : 0}" data-tip="${tip}">${txt}</div>`);
+      bars.push(`<div class="${sel ? "pick" : ""}" style="height:${showBar ? Math.max(2, c * 38) : 0}px"></div>`);
+    }
+    if (f.lo !== undefined && ph !== "prefill") win.push(`<div style="grid-column:${f.lo + 1}/${f.hi + 1}"></div>`);
+    h += `<div class="seq" style="--T:${Tfin};--cw:${cw}px;margin-bottom:10px"><div class="lab">row ${j} · prompt ${M.cfg.pls[j]}</div><div class="row">${cells.join("")}</div><div class="row bars" style="height:${ph === "select" ? 40 : 0}px">${bars.join("")}</div><div class="row win">${win.join("")}</div></div>`;
+  }
+  // cache strip (same for every row)
+  let cb = `<div class="seq" style="--T:${Tfin};--cw:${cw}px"><div class="lab">KV cache (${f.cache}${f.tmp ? " + " + f.tmp + " temporary" : ""} tokens per row)</div><div class="row">`;
+  for (let p = 0; p < Tfin; p++) cb += `<div class="cell ${p < f.cache ? "kv" : p < f.cache + f.tmp ? "tmp" : "none"}" style="height:20px"></div>`;
+  $c("seqs").innerHTML = h + cb + "</div></div>";
+  $c("cap").innerHTML = CAPB[ph](f);
+  $c("counters").innerHTML =
+    `<span class="stat"><b>${f.cnow.toLocaleString()}</b><span>tokens through the model (now)</span></span><span class="stat"><b style="color:var(--bad)">${f.cold.toLocaleString()}</b><span>before: prefix re-encoded every block</span></span>` +
+    `<span class="stat"><b>${f.cpNow.toLocaleString()}</b><span>KV tokens copied (now)</span></span><span class="stat"><b style="color:var(--bad)">${f.cpOld.toLocaleString()}</b><span>before: deepcopy + concat per step</span></span>`;
+  cpMain.hl([ph]); cpHelp.hl([ph]);
+  const w = { prefill: [["x", `[${B}, ${M.padded}]`, "left-padded prompts"], ["cond_past", `${f.cache} tokens`]],
+    append: [["T_prefix", f.P], ["T_total", f.P + (f.cl || 0)], ["attn_block", `[${B}, 1, ${f.cl}, ${f.P + (f.cl || 0)}]`, "block rows only"]],
+    fwd: [["x_block", `[${B}, ${f.cl}]`], ["cond_past", `${f.P} → ${f.P + f.cl} tokens`, "model appended K/V"], ["logits", `[${B}, ${f.cl}, V]`]],
+    rollback: [["cond_past", `${f.P + f.cl} → ${f.P} tokens`, "crop(T_prefix)"]],
+    select: [["k", `[${(f.k || []).join(", ")}]`], ["x_block", `[${B}, ${f.cl}]`, "updated"]],
+    extend: [["x_block", `[${B}, ${f.cl}]`, "committed tokens"], ["cond_past", `${f.P} → ${f.P + f.cl} tokens`]],
+    done: [["break", "yes"]] }[ph];
+  watch($c("watch"), w);
+}
+const st = stepper($c("stp"), showB, 600);
+["b_pls", "b_cfg"].forEach((id) => $c(id).addEventListener("input", rebuildB));
+$c("b_micro").addEventListener("input", applyMicro);
+["b_mnt", "b_bs", "b_steps", "b_eos"].forEach((id) => bindRange(id, rebuildB));
+rebuildB();
+
+/* ---------- attention mask explorer ---------- */
+const CODE_MASK = `def _prepare_for_sampling(x, block_size, pad_token_id, q_start=0):
+    B, T = x.shape
+@pos|    valid = x != pad_token_id                                   # [B, T]
+@pos|    logical_pos = torch.cumsum(valid.long(), dim=-1) - 1
+@pos|    position_ids = torch.where(valid, logical_pos, 0)           # RoPE positions skip padding
+@bid|    block_ids = (torch.arange(T) // block_size).expand(B, -1)   # physical blocks
+@bid|    block_ids = torch.where(valid, block_ids, -1)               # padding → no block
+@mask|    bid_q = block_ids[:, q_start:].view(B, 1, T - q_start, 1)
+@mask|    bid_k = block_ids.view(B, 1, 1, T)
+@mask|    attn_mask = (bid_k <= bid_q) & (bid_q >= 0) & (bid_k >= 0)
+    return attn_mask, position_ids`;
+const cpMask = codePanel($c("a_code"), "bd3lm.py · _prepare_for_sampling", CODE_MASK);
+function buildPrep(pls, bs, gb) {
+  const maxPl = Math.max(...pls), padded = Math.ceil(maxPl / bs) * bs, T = padded + gb * bs;
+  const rows = pls.map((L) => {
+    const kind = []; for (let p = 0; p < T; p++) kind.push(p < padded - L ? "pad" : p < padded ? "prompt" : "mask");
+    let cnt = 0; const valid = kind.map((k) => k !== "pad"), pos = valid.map((v) => (v ? cnt++ : 0));
+    const bid = kind.map((k, p) => (k === "pad" ? -1 : Math.floor(p / bs)));
+    return { kind, valid, pos, bid };
+  });
+  return { rows, T, padded };
+}
+function renderA() {
+  const pls = parsePls($c("a_pls").value), bs = +$c("a_bs").value, gb = +$c("a_gb").value, sel = $c("a_row");
+  if (sel.options.length !== pls.length) sel.innerHTML = pls.map((_, i) => `<option value="${i}">row ${i} (len ${pls[i]})</option>`).join("");
+  const r = Math.min(+sel.value || 0, pls.length - 1), P = buildPrep(pls, bs, gb), R = P.rows[r], T = P.T;
+  const nBlocks = Math.ceil(T / bs); $c("a_qb").max = nBlocks - 1;
+  const qOnly = $c("a_qs").checked, qStart = qOnly ? Math.min(+$c("a_qb").value, nBlocks - 1) * bs : 0;
+  const mc = Math.max(11, Math.min(20, Math.floor(560 / (T + 1))));
+  let h = `<div class="matrix" style="--mc:${mc}px;grid-template-columns:repeat(${T + 1},var(--mc))"><div class="mlab"></div>`;
+  for (let k = 0; k < T; k++) h += `<div class="mlab">${R.bid[k] < 0 ? "–" : R.bid[k]}</div>`;
+  for (let q = qStart; q < T; q++) {
+    h += `<div class="mlab">${R.bid[q] < 0 ? "–" : R.bid[q]}</div>`;
+    for (let k = 0; k < T; k++) { const ok = R.bid[q] >= 0 && R.bid[k] >= 0 && R.bid[k] <= R.bid[q]; h += `<div class="mcell ${ok ? "on" : ""}" data-q="${q}" data-k="${k}"></div>`; }
+  }
+  $c("a_mat").innerHTML = h + "</div>";
+  $c("a_mat").onmouseover = (e) => {
+    const q = e.target.dataset && e.target.dataset.q; if (q === undefined) return;
+    const k = +e.target.dataset.k, qq = +q;
+    $$("#a_mat .mcell").forEach((c) => { c.classList.remove("q"); c.classList.remove("qon"); });
+    $$(`#a_mat .mcell[data-q="${q}"]`).forEach((c) => c.classList.add(c.classList.contains("on") ? "qon" : "q"));
+    const ok = R.bid[qq] >= 0 && R.bid[k] >= 0 && R.bid[k] <= R.bid[qq];
+    $c("a_cap").innerHTML = `query <b>${qq}</b> (${R.kind[qq]}, block ${R.bid[qq]}) → key <b>${k}</b> (${R.kind[k]}, block ${R.bid[k]}): <b>${ok ? "attend" : "blocked"}</b>`;
+    cpMask.hl(["mask"]);
+    watch($c("a_watch"), [["bid_q", R.bid[qq]], ["bid_k", R.bid[k]], ["bid_k <= bid_q", R.bid[k] <= R.bid[qq]], ["bid_q >= 0", R.bid[qq] >= 0], ["bid_k >= 0", R.bid[k] >= 0], ["attn_mask", ok]]);
+  };
+  $c("a_info").innerHTML = `<div class="tblwrap"><table><tr><th>col</th>${R.kind.map((_, i) => `<th>${i}</th>`).join("")}</tr><tr><th>valid</th>${R.valid.map((v) => `<td>${v ? "✓" : "–"}</td>`).join("")}</tr><tr><th>block_id</th>${R.bid.map((v) => `<td>${v}</td>`).join("")}</tr><tr><th>position_ids</th>${R.pos.map((v, i) => `<td>${R.valid[i] ? v : 0}</td>`).join("")}</tr></table></div>`;
+  cpMask.hl(["pos", "bid"]);
+  watch($c("a_watch"), [["T", T], ["padded_prompt_len", P.padded], ["mask shape", `[B, 1, ${T - qStart}, ${T}]`, qOnly ? "q_start=" + qStart : "full"]]);
+}
+["a_pls", "a_row", "a_qs"].forEach((id) => $c(id).addEventListener("input", renderA));
+bindRange("a_bs", renderA); bindRange("a_gb", renderA); bindRange("a_qb", renderA);
+renderA();
+</script>
+</main></body></html>

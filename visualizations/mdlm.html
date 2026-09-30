@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MDLM sampler — dllm/core/samplers/mdlm.py</title>
+<link rel="stylesheet" href="assets/style.css">
+</head><body><main>
+<script src="assets/common.js"></script>
+<script>document.write(navHtml("mdlm.html"))</script>
+
+<h1>MDLM sampler</h1>
+<p class="sub">Block-by-block masked diffusion. Every step the model reads the <b>whole</b> canvas (no cache is possible), but only the current block may be committed. Step with ← →</p>
+
+<div class="tabs"><button id="tab_dec" class="on">Decode</button><button id="tab_win">Block window</button></div>
+
+<!-- ================= DECODE ================= -->
+<div id="pg_dec">
+  <div class="panel">
+    <div class="controls">
+      <label>mode <select id="mode"><option value="sample">sample</option><option value="infill">infill</option></select></label>
+      <label>prompt lens <input type="text" id="pls" value="4,7,2" style="width:80px"></label>
+      <label>max_new_tokens <input type="range" id="mnt" min="4" max="40" value="16"><output id="mnt_o"></output></label>
+      <label>block_size <input type="range" id="bs" min="1" max="20" value="8"><output id="bs_o"></output></label>
+      <label>steps <input type="range" id="steps" min="1" max="32" value="8"><output id="steps_o"></output></label>
+      <label>remasking <select id="remask"><option value="low_confidence">low_confidence</option><option value="random">random</option></select></label>
+      <label>scheduler <select id="sched"><option value="linear">Linear</option><option value="cosine">Cosine</option></select></label>
+      <label><span>micro-steps</span><input type="checkbox" id="micro" checked></label>
+    </div>
+    <div id="stp" style="margin-top:12px"></div>
+  </div>
+  <div class="split" style="margin-top:14px">
+    <div>
+      <div class="cap" id="cap"></div>
+      <div class="panel">
+        <div class="seqs" id="seqs"></div>
+        <div id="extra"></div>
+        <div id="counters" style="margin-top:10px"></div>
+        <div class="legend" style="margin-top:8px">
+          <span><i class="sw" style="background:var(--prompt)"></i>prompt</span>
+          <span><i class="sw" style="border:1px dashed var(--c2);background:repeating-linear-gradient(45deg,transparent 0 3px,var(--hatch) 3px 4px)"></i>masked</span>
+          <span><i class="sw" style="background:color-mix(in srgb,var(--c1) 40%,var(--surface))"></i>committed (# = order)</span>
+          <span><i class="sw" style="background:var(--eos)"></i>EOS pad</span>
+          <span><i class="sw" style="background:var(--c3);height:4px"></i>row's block window</span>
+          <span><i class="sw" style="background:color-mix(in srgb,var(--c4) 38%,var(--surface))"></i>columns the model / post-processing touches</span>
+        </div>
+      </div>
+    </div>
+    <div class="sticky"><div id="code"></div><div id="code2"></div><div id="watch"></div></div>
+  </div>
+</div>
+
+<!-- ================= BLOCK WINDOW ================= -->
+<div id="pg_win" hidden>
+  <div class="panel">
+    <div class="controls">
+      <label>mode <select id="w_mode"><option value="sample">sample</option><option value="infill">infill</option></select></label>
+      <label>prompt lens <input type="text" id="w_pls" value="4,7,2" style="width:80px"></label>
+      <label>max_new_tokens <input type="range" id="w_mnt" min="4" max="40" value="16"><output id="w_mnt_o"></output></label>
+      <label>block_size <input type="range" id="w_bs" min="1" max="20" value="6"><output id="w_bs_o"></output></label>
+      <label>block b <input type="range" id="w_b" min="0" max="5" value="1"><output id="w_b_o"></output></label>
+    </div>
+  </div>
+  <div class="split" style="margin-top:14px">
+    <div>
+      <div class="cap" id="w_cap">Hover a cell: is it inside its row's window?</div>
+      <div class="panel">
+        <div class="seqs" id="w_mat"></div>
+        <div id="w_info" style="margin-top:8px"></div>
+        <div class="legend" style="margin-top:8px">
+          <span><i class="sw" style="background:var(--c3)"></i>window[j, col] = True</span>
+          <span><i class="sw" style="background:var(--prompt)"></i>prompt</span>
+          <span><i class="sw" style="border:1px dashed var(--c2)"></i>masked, outside this block</span>
+          <span><i class="sw" style="background:color-mix(in srgb,var(--c4) 38%,var(--surface))"></i>c0…c1 (union of all windows)</span>
+        </div>
+      </div>
+    </div>
+    <div class="sticky"><div id="w_code"></div><div id="w_watch"></div></div>
+  </div>
+</div>
+
+<script>
+const $c = (id) => document.getElementById(id);
+const parsePls = (v) => { const a = v.split(",").map((s) => Math.max(1, parseInt(s) || 1)).slice(0, 4); return a.length ? a : [4]; };
+const cellW = (T) => Math.max(10, Math.min(30, Math.floor(($c("seqs").clientWidth || 560) / T) - 2));
+
+/* ---------- tabs ---------- */
+$c("tab_dec").onclick = () => { $c("pg_dec").hidden = false; $c("pg_win").hidden = true; $c("tab_dec").classList.add("on"); $c("tab_win").classList.remove("on"); };
+$c("tab_win").onclick = () => { $c("pg_dec").hidden = true; $c("pg_win").hidden = false; $c("tab_win").classList.add("on"); $c("tab_dec").classList.remove("on"); renderW(); };
+
+/* ---------- code ---------- */
+const BLK_SAMPLE = `for b in range(num_blocks):
+@blk|    lo = prompt_lens_t + b * block_size
+@blk|    hi = torch.clamp(lo + block_size, max=prompt_lens_t + max_new_tokens)
+@blk|    window = (cols >= lo) & (cols < hi)                       # [B, T]
+@blk|    c0 = min(prompt_lens) + b * block_size
+@blk|    c1 = max(min(pl + (b+1) * block_size, pl + max_new_tokens) for pl in prompt_lens)
+@blk|    window_w = window[:, c0:c1]
+@blk|    num_transfer_tokens = get_num_transfer_tokens(
+@blk|        mask_index=(x == mask_id) & window, steps=steps_per_block, ...)
+@blk|    k_max_per_step = num_transfer_tokens.max(dim=0).values.tolist()
+`;
+const BLK_INFILL = `for b in range(num_blocks):
+@blk|    start = b * block_size
+@blk|    stop = min(start + block_size, T)
+@blk|    window = (cols >= start) & (cols < torch.clamp(seq_lens_t, max=stop))
+@blk|    window_w = window[:, start:stop]
+@blk|    num_transfer_tokens = get_num_transfer_tokens(
+@blk|        mask_index=(x == mask_id) & window, steps=steps_per_block, ...)
+@blk|    k_max_per_step = num_transfer_tokens.max(dim=0).values.tolist()
+`;
+const STEP = (a, b) => `
+    for i in range(effective_steps):
+@fwd|        logits = self.model(x, attention_mask=attention_mask).logits     # [B, T, V]
+@slice|        logits = _window_logits(logits, ${a}, ${b}, right_shift_logits)     # [B, W, V]
+@pred|        x0 = torch.argmax(add_gumbel_noise(logits, temperature), dim=-1) # [B, W]
+@conf|        p = F.softmax(logits, dim=-1)
+@conf|        x0_p = torch.gather(p, -1, x0.unsqueeze(-1)).squeeze(-1)         # [B, W]
+@topk|        x_w = x[:, ${a}:${b}]
+@topk|        mask_w = x_w == mask_id
+@topk|        x0 = torch.where(mask_w, x0, x_w)
+@conf,topk|        confidence = torch.where(mask_w & window_w, x0_p, -torch.inf)
+@topk|        transfer_index = topk_transfer_mask(
+@topk|            confidence, num_transfer_tokens[:, i], k_max_per_step[i])
+@commit|        x[:, ${a}:${b}] = torch.where(transfer_index, x0, x_w)`;
+const CODE_SAMPLE = BLK_SAMPLE + STEP("c0", "c1"), CODE_INFILL = BLK_INFILL + STEP("start", "stop");
+const CODE_HELP = `def _window_logits(logits, c0, c1, right_shift):
+@slice|    if not right_shift:
+@slice|        return logits[:, c0:c1]
+@slice|    src = torch.arange(c0 - 1, c1 - 1).clamp(min=0)
+@slice|    return logits[:, src]
+
+def topk_transfer_mask(confidence, k, k_max):
+@topk|    transfer = torch.zeros_like(confidence, dtype=torch.bool)
+@topk|    vals, idx = torch.topk(confidence, k=min(k_max, confidence.size(1)), dim=1)
+@topk|    keep = torch.arange(vals.size(1))[None, :] < k[:, None]      # first k per row
+@topk|    keep &= vals > -float("inf")
+@topk|    return transfer.scatter_(1, idx, keep)`;
+let cpMain = codePanel($c("code"), "mdlm.py · MDLMSampler.sample", CODE_SAMPLE);
+const cpHelp = codePanel($c("code2"), "helpers (utils.py / mdlm.py)", CODE_HELP);
+let cpWin = codePanel($c("w_code"), "mdlm.py · MDLMSampler.sample", BLK_SAMPLE.replace(/\n$/, ""));
+
+/* ---------- shared canvas init ---------- */
+function initCanvas(cfg, rnd) {
+  const B = cfg.pls.length, maxPl = Math.max(...cfg.pls), sample = cfg.mode === "sample";
+  const T = sample ? maxPl + cfg.maxNew : maxPl, st = [];
+  for (let j = 0; j < B; j++) {
+    st.push(new Array(T).fill(2));
+    const pl = cfg.pls[j];
+    if (sample) { for (let p = 0; p < pl; p++) st[j][p] = 0; for (let p = pl; p < pl + cfg.maxNew; p++) st[j][p] = 1; }
+    else for (let p = 0; p < pl; p++) st[j][p] = rnd() < 0.45 ? 1 : 0;
+  }
+  const nb = sample ? Math.ceil(cfg.maxNew / cfg.bs) : Math.ceil(T / cfg.bs);
+  return { st, B, T, sample, nb };
+}
+function blockWindow(cfg, st, T, b) {
+  const sample = cfg.mode === "sample", bs = cfg.bs, lo = [], hi = [], cnt = [];
+  for (let j = 0; j < cfg.pls.length; j++) {
+    const pl = cfg.pls[j];
+    if (sample) { lo.push(pl + b * bs); hi.push(Math.min(lo[j] + bs, pl + cfg.maxNew, T)); }
+    else { lo.push(b * bs); hi.push(Math.max(lo[j], Math.min(pl, (b + 1) * bs))); }
+    let c = 0; for (let p = lo[j]; p < hi[j]; p++) if (st[j][p] === 1) c++;
+    cnt.push(c);
+  }
+  const c0 = sample ? Math.min(...lo) : b * bs, c1 = sample ? Math.max(...hi) : Math.min((b + 1) * bs, T);
+  return { lo, hi, cnt, c0, c1 };
+}
+
+/* ---------- decode simulation ---------- */
+let frames = [], allFrames = [], meta = {}, curMode = "sample";
+function simulate(cfg) {
+  const rnd = mulberry32(3), S = ALPHA[cfg.sched];
+  const { st, B, T, nb } = initCanvas(cfg, rnd), cs = st.map(() => new Array(T).fill(-1));
+  const spb = Math.ceil(cfg.steps / nb), snap = (x) => ({ st: st.map((r) => r.slice()), cs: cs.map((r) => r.slice()), ...ctr, ...x });
+  let g = 0; const ctr = { cModel: 0, cNow: 0, cOld: 0 };
+  const out = [snap({ phase: "init", b: -1 })];
+  for (let b = 0; b < nb; b++) {
+    const w = blockWindow(cfg, st, T, b), nt = numTransfer(w.cnt, spb, S, false, rnd);
+    const ctx = { b, nb, ...w, nt: nt.packed, eff: nt.maxLen, spb };
+    out.push(snap({ phase: "block", ...ctx }));
+    for (let i = 0; i < nt.maxLen; i++) {
+      const conf = [], x0 = [], sel = [], top = [], k = nt.packed.map((r) => r[i]), kmax = Math.max(...k);
+      for (let j = 0; j < B; j++) {
+        const c = new Array(T).fill(-Infinity), t0 = new Array(T).fill(null);
+        for (let p = w.c0; p < w.c1; p++) t0[p] = 10 + Math.floor(rnd() * 90);
+        for (let p = w.lo[j]; p < w.hi[j]; p++) if (st[j][p] === 1) {
+          if (cfg.remask === "random") c[p] = rnd();
+          else { const known = (p > 0 && st[j][p - 1] !== 1) || (p < T - 1 && st[j][p + 1] !== 1 && st[j][p + 1] !== 2); c[p] = 0.2 * rnd() + 0.8 * rnd() * (known ? 1 : 0.35); }
+        }
+        const ord = c.map((v, p) => [v, p]).filter((a) => a[0] > -Infinity).sort((a, z) => z[0] - a[0]);
+        conf.push(c); x0.push(t0); top.push(ord.slice(0, kmax).map((a) => a[1])); sel.push(ord.slice(0, k[j]).map((a) => a[1]));
+      }
+      const base = { ...ctx, i, conf, x0, sel, top, k, kmax };
+      for (const ph of ["fwd", "slice", "pred", "conf", "topk"]) {
+        if (ph === "fwd") ctr.cModel += B * T;
+        if (ph === "slice") { ctr.cNow += B * (w.c1 - w.c0); ctr.cOld += B * T; }
+        out.push(snap({ phase: ph, ...base }));
+      }
+      for (let j = 0; j < B; j++) for (const p of sel[j]) { st[j][p] = 3; cs[j][p] = g; }
+      g++;
+      out.push(snap({ phase: "commit", ...base }));
+    }
+  }
+  return { frames: out, meta: { B, T, nb, spb, total: g, cfg } };
+}
+function readCfg() { return { mode: $c("mode").value, pls: parsePls($c("pls").value), maxNew: +$c("mnt").value, bs: +$c("bs").value, steps: +$c("steps").value, remask: $c("remask").value, sched: $c("sched").value }; }
+function rebuild() {
+  const cfg = readCfg();
+  if (cfg.mode !== curMode) { curMode = cfg.mode; $c("code").innerHTML = ""; cpMain = codePanel($c("code"), cfg.mode === "sample" ? "mdlm.py · MDLMSampler.sample" : "mdlm.py · MDLMSampler.infill", cfg.mode === "sample" ? CODE_SAMPLE : CODE_INFILL); }
+  const r = simulate(cfg); allFrames = r.frames; meta = r.meta; applyMicro();
+}
+function applyMicro() { frames = $c("micro").checked ? allFrames : allFrames.filter((f) => ["init", "block", "commit"].includes(f.phase)); st.setN(frames.length, false); }
+
+const CAP = {
+  init: () => `Initial canvas · ${meta.nb} block(s) × up to ${meta.spb} step(s). Press ▶ or →.`,
+  block: (f) => `<b>block ${f.b + 1}/${f.nb}</b> · each row's window (green) is its next block. <code>num_transfer_tokens</code> says how many masks to reveal per step.`,
+  fwd: (f) => `<b>forward</b> · step ${f.i + 1}/${f.eff}: the model reads the <i>whole</i> canvas — all ${meta.T} columns, future masks included. Nothing is cached, so this cost never shrinks.`,
+  slice: (f) => `<b>slice</b> · only columns <code>${f.c0}…${f.c1 - 1}</code> can be committed, so the expensive part (noise, argmax, softmax over V) runs on <b>${f.c1 - f.c0}</b> columns, not ${meta.T}.`,
+  pred: () => `<b>predict</b> · argmax (plus Gumbel noise if temperature &gt; 0) gives a token for every position in the slice.`,
+  conf: () => `<b>confidence</b> · ${meta.cfg.remask === "random" ? "random scores" : "softmax probability of each predicted token"}. Only masked positions inside the window compete; the rest are <code>−inf</code>.`,
+  topk: (f) => `<b>top-k</b> · row <i>b</i> keeps its <code>k[b]</code> = <b>[${f.k.join(", ")}]</b> most confident masks.`,
+  commit: () => `<b>commit</b> · the chosen predictions are written into the canvas. Committed tokens are never re-masked.`,
+};
+function showDec(i) {
+  const f = frames[i]; if (!f) return;
+  const { B, T } = meta, ph = f.phase, cw = cellW(T), total = Math.max(1, meta.total);
+  const inSlice = (p) => p >= f.c0 && p < f.c1, sliced = ["slice", "pred", "conf", "topk", "commit"].includes(ph);
+  let h = "";
+  for (let j = 0; j < B; j++) {
+    const cells = [], bars = [], win = [];
+    for (let p = 0; p < T; p++) {
+      const s = f.st[j][p], sel = (ph === "commit" || ph === "topk") && f.sel[j].includes(p);
+      let cls = "cell", txt = "", tip = `row ${j}, col ${p}`;
+      if (s === 0) { cls += " prompt"; txt = "P"; } else if (s === 1) cls += " mask"; else if (s === 2) { cls += " eos"; txt = "·"; }
+      else { cls += " done" + (f.cs[j][p] / total > 0.55 ? " dark" : ""); txt = f.cs[j][p]; }
+      if (["slice", "pred", "conf", "topk"].includes(ph) && !inSlice(p)) cls += " dim";
+      if (["pred", "conf", "topk"].includes(ph) && inSlice(p) && s === 1 && p >= f.lo[j] && p < f.hi[j]) txt = `<span class="tk">${f.x0[j][p]}</span>`;
+      if (sel) cls += " sel";
+      const c = f.conf && f.conf[j][p], showBar = ["conf", "topk", "commit"].includes(ph) && c > -Infinity;
+      if (showBar) tip += `\nconfidence ${c.toFixed(3)}${sel ? " → chosen" : ""}`;
+      cells.push(`<div class="${cls}" style="--f:${s === 3 ? f.cs[j][p] / total : 0}" data-tip="${tip}">${txt}</div>`);
+      bars.push(`<div class="${sel ? "pick" : ""}" style="height:${showBar ? Math.max(2, c * 38) : 0}px"></div>`);
+    }
+    if (ph !== "init" && f.lo) win.push(`<div style="grid-column:${f.lo[j] + 1}/${Math.max(f.lo[j] + 1, f.hi[j]) + 1}"></div>`);
+    h += `<div class="seq" style="--T:${T};--cw:${cw}px;margin-bottom:10px"><div class="lab">row ${j} · ${meta.cfg.mode === "sample" ? "prompt" : "len"} ${meta.cfg.pls[j]}</div><div class="row">${cells.join("")}</div><div class="row bars" style="height:${["conf", "topk", "commit"].includes(ph) ? 40 : 0}px">${bars.join("")}</div><div class="row win">${win.join("")}</div></div>`;
+  }
+  // model-input strip (the analogue of the KV-cache strip): which columns are touched
+  const label = ph === "fwd" ? `model reads all ${T} columns per row — nothing cached` : sliced ? `kept for post-processing: W = ${f.c1 - f.c0} of ${T} columns` : "model input: —";
+  h += `<div class="seq" style="--T:${T};--cw:${cw}px"><div class="lab">${label}</div><div class="row">` + Array.from({ length: T }, (_, p) => `<div class="cell ${ph === "fwd" || (sliced && inSlice(p)) ? "kv" : "none"}" style="height:20px"></div>`).join("") + "</div></div>";
+  $c("seqs").innerHTML = h;
+  $c("cap").innerHTML = CAP[ph](f);
+
+  let ex = "";
+  if (ph === "block" || ph === "topk" || ph === "commit") {
+    const nt = f.nt, cols = nt[0].length, cur = ph === "block" ? -1 : f.i;
+    ex += `<div class="mini" style="margin-top:6px">num_transfer_tokens  [B, ${cols}]</div><div class="numgrid" style="grid-template-columns:auto repeat(${cols},minmax(26px,1fr))"><div class="ncell hd"></div>` + Array.from({ length: cols }, (_, c) => `<div class="ncell hd">${c}</div>`).join("") +
+      nt.map((r, j) => `<div class="ncell hd">row ${j}</div>` + r.map((v, c) => `<div class="ncell ${v > 0 ? "nz" : ""} ${c === cur ? "cur" : ""}">${v}</div>`).join("")).join("") + "</div>";
+  }
+  if (ph === "topk") ex += `<div class="mini" style="margin-top:8px">topk(k_max=<b>${f.kmax}</b>) per row, then keep the first k[b]:</div>` + f.top.map((t, j) => `<div class="mini">row ${j}: idx=[${t.join(", ")}] · k=<b>${f.k[j]}</b> → keep [${f.sel[j].join(", ")}]</div>`).join("");
+  $c("extra").innerHTML = ex;
+
+  $c("counters").innerHTML =
+    `<span class="stat"><b>${f.cModel.toLocaleString()}</b><span>tokens through the model (B×T every step — can't be cached)</span></span>` +
+    `<span class="stat"><b>${f.cNow.toLocaleString()}</b><span>columns through Gumbel / softmax / argmax (now)</span></span>` +
+    `<span class="stat"><b style="color:var(--bad)">${f.cOld.toLocaleString()}</b><span>before: all T columns</span></span>`;
+
+  cpMain.hl({ init: [], block: ["blk"], fwd: ["fwd"], slice: ["slice"], pred: ["pred"], conf: ["conf"], topk: ["topk"], commit: ["commit"] }[ph]);
+  cpHelp.hl(ph === "slice" ? ["slice"] : ph === "topk" ? ["topk"] : []);
+  const V = "V", W = f.c1 !== undefined ? f.c1 - f.c0 : "-";
+  watch($c("watch"), { init: [["B, T", `${B}, ${T}`], ["num_blocks", meta.nb], ["steps_per_block", meta.spb]],
+    block: [["b", f.b], ["c0, c1", `${f.c0}, ${f.c1}`], ["W", W], ["lo", `[${(f.lo || []).join(", ")}]`], ["hi", `[${(f.hi || []).join(", ")}]`]],
+    fwd: [["x", `[${B}, ${T}]`], ["logits", `[${B}, ${T}, ${V}]`, "whole canvas"]],
+    slice: [["c0, c1", `${f.c0}, ${f.c1}`], ["logits", `[${B}, ${W}, ${V}]`, `was [${B}, ${T}, ${V}]`]],
+    pred: [["x0", `[${B}, ${W}]`, "token per position"]],
+    conf: [["x0_p", `[${B}, ${W}]`], ["confidence", `[${B}, ${W}]`, "−inf off-mask / off-window"]],
+    topk: [["k", `[${(f.k || []).join(", ")}]`], ["k_max", f.kmax], ["transfer_index", `[${B}, ${W}]`, "bool"]],
+    commit: [["step", `block ${f.b + 1} · ${f.i + 1}/${f.eff}`], ["committed", (f.sel || []).map((s) => s.length).reduce((a, b) => a + b, 0), "tokens this step"]] }[ph]);
+}
+const st = stepper($c("stp"), showDec, 600);
+["mode", "pls", "remask", "sched"].forEach((id) => $c(id).addEventListener("input", rebuild));
+$c("micro").addEventListener("input", applyMicro);
+["mnt", "bs", "steps"].forEach((id) => bindRange(id, rebuild));
+rebuild();
+
+/* ---------- block-window explorer ---------- */
+let wMode = "sample";
+function renderW() {
+  const cfg = { mode: $c("w_mode").value, pls: parsePls($c("w_pls").value), maxNew: +$c("w_mnt").value, bs: +$c("w_bs").value };
+  if (cfg.mode !== wMode) { wMode = cfg.mode; $c("w_code").innerHTML = ""; cpWin = codePanel($c("w_code"), "mdlm.py · MDLMSampler." + (cfg.mode === "sample" ? "sample" : "infill"), (cfg.mode === "sample" ? BLK_SAMPLE : BLK_INFILL).replace(/\n$/, "")); }
+  const { st: S, B, T, nb } = initCanvas(cfg, mulberry32(3));
+  $c("w_b").max = nb - 1;
+  const b = Math.min(+$c("w_b").value, nb - 1), w = blockWindow(cfg, S, T, b), cw = Math.max(10, Math.min(30, Math.floor(($c("w_mat").clientWidth || 560) / T) - 2));
+  let h = `<div class="seq" style="--T:${T};--cw:${cw}px;margin-bottom:6px"><div class="lab">c0 = ${w.c0}, c1 = ${w.c1} → W = ${w.c1 - w.c0} columns are sliced for post-processing</div><div class="row">` +
+    Array.from({ length: T }, (_, p) => `<div class="cell ${p >= w.c0 && p < w.c1 ? "kv" : "none"}" style="height:14px"></div>`).join("") + "</div></div>";
+  for (let j = 0; j < B; j++) {
+    let cells = "";
+    for (let p = 0; p < T; p++) {
+      const s = S[j][p], inW = p >= w.lo[j] && p < w.hi[j];
+      let cls = "cell", txt = "";
+      if (inW) { cls += " done"; txt = s === 1 ? "" : ""; } else if (s === 0) { cls += " prompt"; txt = "P"; } else if (s === 1) cls += " mask"; else { cls += " eos"; txt = "·"; }
+      cells += `<div class="${cls}" style="${inW ? "background:var(--c3);color:#fff" : ""}" data-j="${j}" data-p="${p}">${inW ? "" : txt}</div>`;
+    }
+    h += `<div class="seq" style="--T:${T};--cw:${cw}px;margin-bottom:10px"><div class="lab">row ${j} · ${cfg.mode === "sample" ? "prompt" : "len"} ${cfg.pls[j]} · lo=${w.lo[j]} hi=${w.hi[j]} · masks in window = <b>${w.cnt[j]}</b></div><div class="row">${cells}</div></div>`;
+  }
+  $c("w_mat").innerHTML = h;
+  $c("w_mat").onmouseover = (e) => {
+    const j = e.target.dataset && e.target.dataset.j; if (j === undefined) return;
+    const jj = +j, p = +e.target.dataset.p, ge = p >= w.lo[jj], lt = p < w.hi[jj];
+    $c("w_cap").innerHTML = `row <b>${jj}</b>, col <b>${p}</b>: <code>cols ≥ lo</code> = ${ge}, <code>cols &lt; hi</code> = ${lt} → window = <b>${ge && lt}</b>`;
+    cpWin.hl(["blk"]);
+    watch($c("w_watch"), [["cols", p], ["lo[j]", w.lo[jj]], ["hi[j]", w.hi[jj]], ["cols >= lo", ge], ["cols < hi", lt], ["window[j, cols]", ge && lt], ["c0, c1", `${w.c0}, ${w.c1}`]]);
+  };
+  cpWin.hl(["blk"]);
+  watch($c("w_watch"), [["b", `${b} of ${nb - 1}`], ["lo", `[${w.lo.join(", ")}]`], ["hi", `[${w.hi.join(", ")}]`], ["c0, c1", `${w.c0}, ${w.c1}`, "union of the rows' windows"], ["mask_index.sum(1)", `[${w.cnt.join(", ")}]`, "→ get_num_transfer_tokens"]]);
+  $c("w_info").innerHTML = cfg.mode === "sample" ? `<div class="mini">windows are aligned to each row's own prompt end, so they are offset; the slice covers their union.</div>` : `<div class="mini">infill: every row shares the same columns, clipped at its own length.</div>`;
+}
+["w_mode", "w_pls"].forEach((id) => $c(id).addEventListener("input", renderW));
+["w_mnt", "w_bs", "w_b"].forEach((id) => bindRange(id, renderW));
+renderW();
+</script>
+</main></body></html>
